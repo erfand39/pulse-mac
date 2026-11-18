@@ -28,7 +28,7 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
       - run: bash scripts/verify-mac.sh
       - run: env PULSE_PACKAGE_SMOKE=1 "dist/mac-arm64/Pulse Mac.app/Contents/MacOS/Pulse Mac"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pulse-mac-arm64
           path: |
