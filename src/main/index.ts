@@ -1,14 +1,16 @@
-import { app, BrowserWindow, Menu, clipboard, nativeTheme, shell, Tray, nativeImage } from 'electron'
-import { existsSync, readFileSync, unlinkSync } from 'node:fs'
+import {
+  app, BrowserWindow, Menu, clipboard, dialog, nativeTheme, Tray, nativeImage,
+  powerMonitor, session
+} from 'electron'
 import { join } from 'node:path'
-import { app as electronApp } from 'electron'
+import { pathToFileURL } from 'node:url'
 import { Store } from './store'
 import { DownloadManager } from './manager'
 import { registerIpc } from './ipc'
-import { applyLaunchAtStartup } from './autostart'
 import { IP } from '@shared/ipc'
 import type { MainEvent } from '@shared/types'
 import { isLocalUrl, scanClipboardUrls } from '@shared/urls'
+import { formatBytes } from './util'
 
 let mainWindow: BrowserWindow | null = null
 let manager: DownloadManager
@@ -16,269 +18,244 @@ let store: Store
 let clipboardTimer: NodeJS.Timeout | null = null
 let lastClipboard = ''
 let tray: Tray | null = null
+let quitting = false
+let quitReady = false
+let trayLabel = ''
+let initialized = false
+const pendingTorrents: string[] = []
 
-// Windows reads the taskbar name and icon from the AppUserModelID at process
-// start. Setting these before `ready` is what makes the taskbar show "Pulse"
-// and the Pulse icon instead of Electron's defaults. The explicit userData
-// path keeps existing profiles at %APPDATA%\pulse-download-manager.
-electronApp.setName('Pulse')
-electronApp.setAppUserModelId('com.pulse.downloadmanager.app')
-electronApp.setPath(
-  'userData',
-  join(electronApp.getPath('appData'), 'pulse-download-manager')
-)
+app.setName('Pulse Mac')
+const smoke = app.isPackaged && process.env.PULSE_PACKAGE_SMOKE === '1'
+app.setPath('userData', join(app.getPath('appData'), smoke ? 'pulse-mac-smoke' : 'pulse-mac'))
+const gotLock = app.requestSingleInstanceLock()
 
-const gotLock = electronApp.requestSingleInstanceLock()
-if (!gotLock) {
-  electronApp.quit()
-}
+const rendererPath = join(__dirname, '../renderer/index.html')
+const devUrl = app.isPackaged ? undefined : process.env.ELECTRON_RENDERER_URL
+const rendererUrl = devUrl ? new URL(devUrl).href : pathToFileURL(rendererPath).href
+
 function send(event: MainEvent): void {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send(IP.event, event)
-  }
-}
-
-/**
- * Early development builds could leave an "Electron.lnk" in the Start Menu
- * that points at node_modules\electron\dist\electron.exe but carries Pulse's
- * AppUserModelID. Windows then uses that shortcut's name and Electron icon for
- * the taskbar button, even when the packaged Pulse.exe is running.
- */
-function removeStaleElectronShortcut(): void {
-  if (process.platform !== 'win32') return
-  const programs = join(
-    electronApp.getPath('appData'),
-    'Microsoft',
-    'Windows',
-    'Start Menu',
-    'Programs'
-  )
-  const aumids = ['com.pulse.downloadmanager', 'com.pulse.downloadmanager.app'].map((id) =>
-    Buffer.from(id, 'utf16le')
-  )
-  const electronExe = Buffer.from('electron.exe', 'utf16le')
-  for (const name of ['Electron.lnk', 'Pulse.lnk']) {
-    const file = join(programs, name)
-    try {
-      if (!existsSync(file)) continue
-      const data = readFileSync(file)
-      if (aumids.some((id) => data.includes(id)) && data.includes(electronExe)) {
-        unlinkSync(file)
-      }
-    } catch {
-      /* The shortcut may be locked; the window icon still applies. */
+  if (event.type === 'settings') configureClipboard()
+  if (event.type === 'stats' && tray) {
+    const { activeCount, downSpeed } = event.stats
+    const label = activeCount ? `${activeCount} · ${formatBytes(downSpeed)}/s` : ''
+    if (label !== trayLabel) {
+      trayLabel = label
+      tray.setTitle(label)
     }
   }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (event.type === 'task:add' || event.type === 'task:update') {
+      const { headers: _headers, ...task } = event.task
+      mainWindow.webContents.send(IP.event, { ...event, task })
+    } else mainWindow.webContents.send(IP.event, event)
+  }
 }
 
-function appIconPath(): string {
-  return electronApp.isPackaged
-    ? join(process.resourcesPath, process.platform === 'win32' ? 'icon.ico' : 'icon.png')
-    : join(__dirname, '../../resources', process.platform === 'win32' ? 'icon.ico' : 'icon.png')
-}
-
-function createWindow(): void {
-  mainWindow = new BrowserWindow({
-    width: 1420,
-    height: 900,
-    minWidth: 1040,
-    minHeight: 640,
+function createWindow(): BrowserWindow {
+  const win = new BrowserWindow({
+    width: 1220,
+    height: 780,
+    minWidth: 720,
+    minHeight: 480,
     show: false,
-    frame: false,
-    backgroundColor: store.settings.theme === 'dark' ? '#0a0c12' : '#f4f6fb',
-    title: 'Pulse',
-    icon: appIconPath(),
-    autoHideMenuBar: true,
+    title: 'Pulse Mac',
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#101216' : '#f4f6fb',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
       spellcheck: false,
-      webSecurity: true,
-      backgroundThrottling: false
+      devTools: !app.isPackaged
     }
   })
-
-  if (process.platform === 'win32') {
-    // The taskbar button keeps its own app details. Without this, Windows can
-    // fall back to Electron's name/icon even though the window icon is Pulse.
-    mainWindow.setAppDetails({
-      appId: 'com.pulse.downloadmanager.app',
-      appIconPath: appIconPath(),
-      appIconIndex: 0,
-      relaunchCommand: process.env.PORTABLE_EXECUTABLE_FILE || process.execPath,
-      relaunchDisplayName: 'Pulse'
-    })
-  }
-
-  mainWindow.once('ready-to-show', () => {
-    mainWindow?.show()
+  mainWindow = win
+  win.once('ready-to-show', () => {
+    if (process.platform !== 'darwin' || !app.getLoginItemSettings().wasOpenedAtLogin) win.show()
   })
-
-  mainWindow.on('maximize', () => send({ type: 'window:state', maximized: true }))
-  mainWindow.on('unmaximize', () => send({ type: 'window:state', maximized: false }))
-
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https?:/i.test(url)) void shell.openExternal(url)
-    return { action: 'deny' }
-  })
-
-  mainWindow.webContents.on('will-navigate', (event, url) => {
-    const devUrl = process.env['ELECTRON_RENDERER_URL']
-    if (devUrl && url.startsWith(devUrl)) return
-    if (url.startsWith('file://')) return
-    event.preventDefault()
-    if (/^https?:/i.test(url)) void shell.openExternal(url)
-  })
-
-  // Keep useful keyboard shortcuts even though the native menu is hidden.
-  mainWindow.webContents.on('before-input-event', (event, input) => {
-    if (input.type !== 'keyDown') return
-    const ctrl = input.control || input.meta
-    if (input.key === 'F12' || (ctrl && input.shift && input.key.toLowerCase() === 'i')) {
-      mainWindow?.webContents.toggleDevTools()
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  win.webContents.on('will-navigate', (event) => event.preventDefault())
+  win.webContents.on('will-redirect', (event) => event.preventDefault())
+  win.on('close', (event) => {
+    if (!quitting && store.settings.keepRunningOnClose) {
       event.preventDefault()
-    }
-    if (ctrl && input.key.toLowerCase() === 'r' && input.shift) {
-      mainWindow?.webContents.reload()
+      win.hide()
+    } else if (!quitting) {
       event.preventDefault()
+      app.quit()
     }
   })
-
-  const devUrl = process.env['ELECTRON_RENDERER_URL']
-  if (devUrl) {
-    void mainWindow.loadURL(devUrl)
-  } else {
-    void mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
-  }
-
-  mainWindow.on('close', (event) => {
-    if (!quitting) {
-      event.preventDefault()
-      mainWindow?.hide()
-    }
-  })
-
-  mainWindow.on('closed', () => {
-    mainWindow = null
-  })
+  win.on('closed', () => { if (mainWindow === win) mainWindow = null })
+  if (devUrl) void win.loadURL(rendererUrl)
+  else void win.loadFile(rendererPath)
+  return win
 }
 
-function startClipboardWatcher(): void {
+function showWindow(event?: MainEvent): void {
+  if (quitting) return
+  const win = mainWindow ?? createWindow()
+  if (win.isMinimized()) win.restore()
+  win.show()
+  win.focus()
+  if (event) {
+    if (win.webContents.isLoading()) {
+      win.webContents.once('did-finish-load', () => send(event))
+    } else send(event)
+  }
+}
+
+function configureClipboard(): void {
   if (clipboardTimer) clearInterval(clipboardTimer)
+  clipboardTimer = null
+  if (!store.settings.clipboardWatch) {
+    lastClipboard = ''
+    return
+  }
   clipboardTimer = setInterval(async () => {
-    if (!manager.settings().clipboardWatch) return
+    if (!mainWindow?.isFocused()) return
     const text = (await clipboard.readText()).trim()
     if (!text || text === lastClipboard) return
     lastClipboard = text
     const scan = scanClipboardUrls(text)
-    if (scan.direct.length >= 2) {
-      send({ type: 'clipboard:batch', urls: scan.urls })
-      return
-    }
-    if (scan.direct.length === 1) {
-      send({ type: 'clipboard:url', url: scan.direct[0] })
-      return
-    }
-    if (scan.urls.length === 1 && !isLocalUrl(scan.urls[0])) {
+    if (scan.direct.length >= 2) send({ type: 'clipboard:batch', urls: scan.urls })
+    else if (scan.urls.length === 1 && !isLocalUrl(scan.urls[0])) {
       send({ type: 'clipboard:url', url: scan.urls[0] })
     }
-  }, 1600)
+  }, 1800)
 }
 
-function createTray(): void {
-  const image = nativeImage.createFromPath(appIconPath())
-  tray = new Tray(image.resize({ width: 24, height: 24 }))
-
-  const contextMenu = Menu.buildFromTemplate([
+function setupMenus(): void {
+  const fa = store.settings.language === 'fa'
+  const label = (en: string, persian: string): string => fa ? persian : en
+  const controls: Electron.MenuItemConstructorOptions[] = [
+    { label: label('Pause All', 'توقف همه'), click: () => void manager.pauseAll() },
+    { label: label('Resume All', 'ادامهٔ همه'), click: () => void manager.resumeAll() }
+  ]
+  Menu.setApplicationMenu(Menu.buildFromTemplate([
     {
-      label: 'Show Pulse',
-      click: () => {
-        if (mainWindow) {
-          if (mainWindow.isMinimized()) mainWindow.restore()
-          mainWindow.show()
-          mainWindow.focus()
-        }
-      }
+      label: app.name,
+      submenu: [
+        { role: 'about' },
+        { label: label('Settings…', 'تنظیمات…'), accelerator: 'Cmd+,',
+          click: () => showWindow({ type: 'navigate', view: 'settings' }) },
+        { type: 'separator' },
+        { role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' },
+        { type: 'separator' }, { role: 'quit' }
+      ]
     },
+    { role: 'editMenu' },
+    { label: label('Downloads', 'دانلودها'), submenu: controls },
+    { role: 'windowMenu' },
+    { role: 'help', submenu: [
+      { label: label('Pulse Mac Information', 'دربارهٔ Pulse Mac'),
+        click: () => showWindow({ type: 'navigate', view: 'about' }) }
+    ] }
+  ]))
+  const dir = app.isPackaged ? process.resourcesPath : join(__dirname, '../../resources')
+  const image = nativeImage.createFromPath(join(dir, 'menubarTemplate.png'))
+  image.setTemplateImage(true)
+  tray ??= new Tray(image)
+  tray.setToolTip('Pulse Mac')
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: label('Show Pulse Mac', 'نمایش Pulse Mac'), click: () => showWindow() },
+    ...controls,
     { type: 'separator' },
-    {
-      label: 'Quit',
-      click: () => {
-        electronApp.quit()
-      }
-    }
-  ])
+    { role: 'quit' }
+  ]))
+}
 
-  tray.setToolTip('Pulse Download Manager')
-  tray.setContextMenu(contextMenu)
-  tray.on('click', () => {
-    if (mainWindow?.isVisible()) {
-      mainWindow.hide()
-    } else {
-      mainWindow?.show()
-      mainWindow?.focus()
-    }
-  })
+async function openTorrent(path: string): Promise<void> {
+  showWindow()
+  try {
+    await manager.addTorrentFile(path)
+  } catch {
+    await dialog.showMessageBox({ type: 'error', message: 'Could not open this torrent file.' })
+  }
 }
 
 async function bootstrap(): Promise<void> {
-  await electronApp.whenReady()
-  Menu.setApplicationMenu(null)
-
+  await app.whenReady()
+  app.setAboutPanelOptions({
+    applicationName: 'Pulse Mac',
+    applicationVersion: app.getVersion(),
+    version: `macOS ${process.getSystemVersion()} · ${process.arch}`,
+    credits: 'Pulse Download Manager by TheGreatAzizi · GPL-3.0-or-later'
+  })
+  session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false))
+  session.defaultSession.setPermissionCheckHandler(() => false)
   store = new Store()
   await store.load()
   nativeTheme.themeSource = store.settings.theme
-  void applyLaunchAtStartup(store.settings.launchAtStartup)
-
-  manager = new DownloadManager({ store, emit: send })
+  manager = new DownloadManager({
+    store,
+    emit: (event) => {
+      send(event)
+      if (event.type === 'settings' && !smoke && process.platform === 'darwin') setupMenus()
+    },
+    openTaskView: (id) => showWindow({ type: 'select-task', id })
+  })
+  if (smoke) {
+    const win = createWindow()
+    registerIpc(manager, () => mainWindow, rendererUrl)
+    await new Promise<void>((resolve, reject) => {
+      win.webContents.once('did-finish-load', () => resolve())
+      win.webContents.once('did-fail-load', () => reject(new Error('App did not load')))
+    })
+    await Promise.race([
+      Promise.all([
+        manager.torrent.init(),
+        win.webContents.executeJavaScript("new Promise((resolve, reject) => { const start = Date.now(); const check = () => window.pulse && document.querySelector('main') ? resolve(true) : Date.now() - start > 15000 ? reject(new Error('Renderer did not initialize')) : setTimeout(check, 50); check(); })")
+      ]),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Package smoke test timed out')), 20_000))
+    ])
+    await manager.shutdown()
+    app.exit(0)
+    return
+  }
   await manager.init()
-
-  registerIpc(manager, () => mainWindow)
-  removeStaleElectronShortcut()
+  registerIpc(manager, () => mainWindow, rendererUrl)
   createWindow()
-  createTray()
-  startClipboardWatcher()
+  if (process.platform === 'darwin') setupMenus()
+  configureClipboard()
 
-  electronApp.on('second-instance', (_event, argv) => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore()
-      mainWindow.focus()
-    }
-    const url = argv.find((a) => /^(https?:\/\/|magnet:)/i.test(a))
-    if (url) setTimeout(() => send({ type: 'open-add', url }), 800)
-  })
-
-  electronApp.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
-  })
+  powerMonitor.on('suspend', () => void manager.suspend())
+  powerMonitor.on('resume', () => void manager.wake())
+  app.on('activate', () => showWindow())
+  app.on('second-instance', () => showWindow())
+  initialized = true
+  for (const path of pendingTorrents.splice(0)) void openTorrent(path)
+  if (store.warning) {
+    await dialog.showMessageBox({ type: 'warning', message: store.warning })
+  }
 }
 
-electronApp.on('window-all-closed', () => {
-  // Keep app running for tray on Windows/Linux
-  if (process.platform !== 'darwin') {
-    mainWindow?.hide()
-  }
+app.on('open-file', (event, path) => {
+  event.preventDefault()
+  if (initialized) void openTorrent(path)
+  else if (pendingTorrents.length < 20) pendingTorrents.push(path)
 })
 
-let quitting = false
-electronApp.on('before-quit', (event) => {
-  if (quitting) return
+app.on('window-all-closed', () => undefined)
+app.on('before-quit', (event) => {
+  if (quitReady) return
   event.preventDefault()
+  if (quitting) return
   quitting = true
   if (clipboardTimer) clearInterval(clipboardTimer)
   void (async () => {
     try {
       await manager?.shutdown()
-    } finally {
-      electronApp.exit(0)
+      quitReady = true
+      app.quit()
+    } catch {
+      await dialog.showMessageBox({ type: 'error', message: 'Pulse Mac could not save its state. Check the disk and quit again.' })
+      quitting = false
     }
   })()
 })
 
-process.on('uncaughtException', (err) => {
-  console.error('[main] uncaught exception:', err)
+if (!gotLock) app.exit(0)
+else void bootstrap().catch(async () => {
+  if (!smoke) await dialog.showMessageBox({ type: 'error', message: 'Pulse Mac could not start. Your previous state was preserved.' })
+  app.exit(1)
 })
-
-if (gotLock) void bootstrap()

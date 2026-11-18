@@ -1,171 +1,183 @@
 import { BrowserWindow, app, clipboard, dialog, ipcMain, shell } from 'electron'
-import { statfs } from 'node:fs/promises'
-import type { AddDownloadInput, AddTorrentInput, AppSnapshot, MainEvent, Settings, UpdateInfo } from '@shared/types'
+import { realpath, statfs } from 'node:fs/promises'
+import { isAbsolute } from 'node:path'
+import { z } from 'zod'
+import type { AppSnapshot } from '@shared/types'
 import { IP } from '@shared/ipc'
 import type { DownloadManager } from './manager'
 import { isAutoStartSupported } from './autostart'
 import { getGithubRepo, searchGithubRepos } from './github'
-import * as updater from './updater'
+import { settingsPatch, shapes } from './validate'
 
-export function registerIpc(manager: DownloadManager, getWindow: () => BrowserWindow | null): void {
-  const handle = (channel: string, fn: (...args: any[]) => any): void => {
-    ipcMain.handle(channel, async (_event, ...args) => {
-      try {
-        return await fn(...args)
-      } catch (err) {
-        const message = (err as Error)?.message || String(err)
-        manager.toast('error', message)
-        throw new Error(message)
+export function registerIpc(
+  manager: DownloadManager,
+  getWindow: () => BrowserWindow | null,
+  rendererUrl: string
+): void {
+  const dirs = new Set<string>()
+  const torrentFiles = new Set<string>()
+  const cookieFiles = new Set<string>()
+  const selectedTools = { ytDlpPath: new Set<string>(), ffmpegPath: new Set<string>() }
+  const handle = <S extends z.ZodType>(
+    channel: string,
+    schema: S,
+    fn: (args: z.output<S>, win: BrowserWindow) => unknown
+  ): void => {
+    ipcMain.handle(channel, async (event, ...args) => {
+      const win = getWindow()
+      const frame = event.senderFrame
+      if (!win || win.webContents !== event.sender || !frame || frame.parent || frame.url !== rendererUrl) {
+        throw new Error('Request rejected.')
       }
+      const parsed = schema.safeParse(args.map((value) => value === null ? undefined : value))
+      if (!parsed.success) throw new Error('Invalid request. Check the link, path or settings.')
+      return fn(parsed.data, win)
     })
   }
-
-  // Update calls report their own errors in the UI, so avoid an extra toast.
-  const handleQuiet = (channel: string, fn: (...args: any[]) => any): void => {
-    ipcMain.handle(channel, async (_event, ...args) => fn(...args))
+  const none = z.tuple([])
+  const id = z.tuple([shapes.id])
+  const permittedDir = async (chosen?: string): Promise<string | undefined> => {
+    if (!chosen || chosen === manager.settings().downloadDir) return undefined
+    const target = await realpath(chosen)
+    if (!dirs.has(target) || target !== chosen) throw new Error('Choose the destination in the folder picker.')
+    return target
   }
 
-  const send = (event: MainEvent): void => {
-    getWindow()?.webContents.send(IP.event, event)
-  }
-
-  handle(IP.snapshot, async (): Promise<AppSnapshot> => {
+  handle(IP.snapshot, none, async (_, win): Promise<AppSnapshot> => {
     const settings = manager.settings()
-    let freeDisk = 0
-    try {
-      const info = await statfs(settings.downloadDir)
-      freeDisk = info.bavail * info.bsize
-    } catch {
-      freeDisk = 0
-    }
+    const info = await statfs(settings.downloadDir).catch(() => null)
     return {
-      tasks: manager.list(),
-      settings,
-      stats: manager.stats(),
+      tasks: manager.list().map(({ headers: _headers, ...task }) => task),
+      settings, stats: manager.stats(),
       system: {
         platform: process.platform,
-        version: process.getSystemVersion?.() || '',
+        arch: process.arch,
+        version: process.getSystemVersion(),
         appVersion: app.getVersion(),
-        freeDisk,
+        freeDisk: info ? info.bavail * info.bsize : 0,
         downloadDir: settings.downloadDir,
-        defaultDir: settings.downloadDir,
+        defaultDir: app.getPath('downloads'),
         runtime: {
-          electron: process.versions.electron || '',
-          chrome: process.versions.chrome || '',
-          node: process.versions.node || ''
+          electron: process.versions.electron,
+          chrome: process.versions.chrome,
+          node: process.versions.node
         },
-        maximized: getWindow()?.isMaximized() ?? false,
+        maximized: win.isMaximized(),
         autoStartSupported: isAutoStartSupported()
       }
     }
   })
 
-  handle(IP.probe, (url: string, headers?: Record<string, string>) => manager.probe(url, headers))
+  handle(IP.probe, z.tuple([shapes.httpUrl, shapes.headers]), ([url, headers]) => manager.probe(url, headers))
+  handle(IP.probeYoutube, z.tuple([shapes.httpUrl]), ([url]) => manager.youtube.probe(url))
+  handle(IP.addDownload, z.tuple([shapes.add]), async ([input]) =>
+    manager.addDownload({ ...input, dir: await permittedDir(input.dir) }))
+  handle(IP.addTorrent, z.tuple([shapes.torrent]), async ([input]) => {
+    const dir = await permittedDir(input.dir)
+    if (input.uri && isAbsolute(input.uri)) {
+      if (!torrentFiles.has(input.uri)) throw new Error('Choose the file in the torrent picker.')
+      return manager.addTorrentFile(input.uri, { ...input, dir })
+    }
+    return manager.addTorrent({ ...input, dir })
+  })
+  handle(IP.pause, id, ([value]) => manager.pause(value))
+  handle(IP.resume, id, ([value]) => manager.resume(value))
+  handle(IP.cancel, id, ([value]) => manager.cancel(value))
+  handle(IP.retry, id, ([value]) => manager.retry(value))
+  handle(IP.prioritize, id, ([value]) => manager.prioritize(value))
+  handle(IP.selectTorrentFiles, z.tuple([shapes.id, z.array(z.number().int().min(0).max(10_000)).min(1).max(10_000)]),
+    ([value, indices]) => manager.selectTorrentFiles(value, [...new Set(indices)]))
+  handle(IP.networkChanged, z.tuple([z.boolean()]), ([online]) => manager.networkChanged(online))
+  handle(IP.reveal, id, ([value]) => manager.reveal(value))
+  handle(IP.open, id, ([value]) => manager.open(value))
+  handle(IP.clearCompleted, none, () => manager.clearCompleted())
+  handle(IP.resumeWithUrl, z.tuple([shapes.id, shapes.httpUrl]), ([value, url]) => manager.resumeWithUrl(value, url))
 
-  handle(IP.probeYoutube, (url: string) => manager.youtube.probe(url))
+  handle(IP.remove, z.tuple([shapes.id, z.boolean()]), async ([value, deleteFile], win) => {
+    if (deleteFile) {
+      const task = manager.get(value)
+      if (!task) return
+      const persian = manager.settings().language === 'fa'
+      const { response } = await dialog.showMessageBox(win, {
+        type: 'warning',
+        message: persian ? 'فایل‌های این دانلود حذف شوند؟' : 'Delete files owned by this download?',
+        detail: task.name,
+        buttons: persian ? ['لغو', 'حذف'] : ['Cancel', 'Delete'],
+        defaultId: 0, cancelId: 0, noLink: true
+      })
+      if (response !== 1) return
+    }
+    await manager.remove(value, deleteFile)
+  })
 
-  handle(IP.addDownload, (input: AddDownloadInput) => manager.addDownload(input))
+  handle(IP.updateSettings, z.tuple([settingsPatch]), async ([patch], win) => {
+    if (patch.downloadDir) await permittedDir(patch.downloadDir)
+    if (patch.cookiesFile && patch.cookiesFile !== manager.settings().cookiesFile && !cookieFiles.has(patch.cookiesFile)) {
+      throw new Error('Choose the cookie file in the file picker.')
+    }
+    for (const tool of ['ytDlpPath', 'ffmpegPath'] as const) {
+      if (patch[tool] && patch[tool] !== manager.settings()[tool] && !selectedTools[tool].has(patch[tool])) {
+        throw new Error('Choose the executable in the file picker.')
+      }
+    }
+    if (patch.cookiesBrowser && patch.cookiesBrowser !== manager.settings().cookiesBrowser) {
+      const fa = manager.settings().language === 'fa'
+      const { response } = await dialog.showMessageBox(win, {
+        type: 'warning',
+        message: fa ? `اجازهٔ خواندن کوکی‌های ${patch.cookiesBrowser}؟` : `Allow yt-dlp to read cookies from ${patch.cookiesBrowser}?`,
+        buttons: fa ? ['لغو', 'اجازه'] : ['Cancel', 'Allow'],
+        defaultId: 0, cancelId: 0, noLink: true
+      })
+      if (response !== 1) delete patch.cookiesBrowser
+    }
+    return manager.updateSettings(patch)
+  })
 
-  handle(IP.addTorrent, (input: AddTorrentInput) => manager.addTorrent(input))
+  handle(IP.setGithubToken, z.tuple([shapes.credential]), async ([token]) => {
+    await manager.store.credential.set(token)
+    manager.updateSettings({ githubTokenConfigured: !!token })
+  })
+  handle(IP.setSpeedLimit, z.tuple([shapes.speed]), ([bytes]) => manager.setSpeedLimit(bytes))
+  handle(IP.installYtDlp, none, () => manager.installYtdlp())
+  handle(IP.rescanTools, none, () => manager.rescanTools())
+  handle(IP.githubSearch, z.tuple([shapes.text(200), shapes.page]), async ([query, page]) =>
+    searchGithubRepos(await manager.store.credential.get(), query, page))
+  handle(IP.githubRepo, z.tuple([shapes.repo]), async ([name]) =>
+    getGithubRepo(await manager.store.credential.get(), name))
 
-  handle(IP.pause, (id: string) => manager.pause(id))
-
-  handle(IP.resume, (id: string) => manager.resume(id))
-
-  handle(IP.cancel, (id: string) => manager.cancel(id))
-
-  handle(IP.remove, (id: string, deleteFile: boolean) => manager.remove(id, deleteFile))
-
-  handle(IP.retry, (id: string) => manager.retry(id))
-
-  handle(IP.reveal, (id: string) => manager.reveal(id))
-
-  handle(IP.open, (id: string) => manager.open(id))
-
-  handle(IP.clearCompleted, () => manager.clearCompleted())
-
-  handle(IP.updateSettings, (patch: Partial<Settings>) => manager.updateSettings(patch))
-
-  handle(IP.setSpeedLimit, (bytes: number) => manager.setSpeedLimit(bytes))
-
-  handle(IP.installYtDlp, () => manager.installYtdlp())
-
-  handle(IP.rescanTools, () => manager.rescanTools())
-
-  handle(IP.githubSearch, (query: string, page?: number) =>
-    searchGithubRepos(manager.settings().githubToken, query, page)
-  )
-
-  handle(IP.githubRepo, (fullName: string) =>
-    getGithubRepo(manager.settings().githubToken, fullName)
-  )
-
-  handle(IP.readClipboard, () => manager.readClipboardUrl())
-  handle(IP.writeClipboard, (text: string) => clipboard.writeText(text))
-
-  handle(IP.chooseDir, async (current?: string, title?: string, buttonLabel?: string) => {
-    const win = getWindow()
-    const result = await dialog.showOpenDialog(win!, {
-      title: title || 'Choose download folder',
-      buttonLabel,
-      defaultPath: current || manager.settings().downloadDir,
-      properties: ['openDirectory', 'createDirectory']
+  handle(IP.readClipboard, none, () => manager.readClipboardUrl())
+  handle(IP.writeClipboard, z.tuple([z.string().max(8192)]), ([text]) => clipboard.writeText(text))
+  handle(IP.chooseDir, z.tuple([shapes.dir, shapes.text(100).optional(), shapes.text(50).optional()]),
+    async ([_current, title, buttonLabel], win) => {
+      const result = await dialog.showOpenDialog(win, {
+        title: title || 'Choose download folder', buttonLabel,
+        defaultPath: manager.settings().downloadDir,
+        properties: ['openDirectory', 'createDirectory']
+      })
+      if (result.canceled || !result.filePaths[0]) return null
+      const path = await realpath(result.filePaths[0])
+      dirs.add(path)
+      return path
     })
-    return result.canceled ? null : result.filePaths[0] || null
+
+  const chooseFile = async (win: BrowserWindow, options: Electron.OpenDialogOptions, allowed: Set<string>): Promise<string | null> => {
+    const result = await dialog.showOpenDialog(win, { ...options, properties: ['openFile'] })
+    if (result.canceled || !result.filePaths[0]) return null
+    const path = await realpath(result.filePaths[0])
+    allowed.add(path)
+    return path
+  }
+  handle(IP.chooseTorrent, none, (_, win) => chooseFile(win, {
+    title: 'Open torrent file', filters: [{ name: 'Torrent files', extensions: ['torrent'] }]
+  }, torrentFiles))
+  handle(IP.chooseCookies, none, (_, win) => chooseFile(win, {
+    title: 'Select a cookies.txt file', filters: [{ name: 'Cookies file', extensions: ['txt'] }]
+  }, cookieFiles))
+  handle(IP.chooseTool, z.tuple([z.enum(['ytDlpPath', 'ffmpegPath'])]), ([tool], win) =>
+    chooseFile(win, { title: tool === 'ffmpegPath' ? 'Choose FFmpeg' : 'Choose yt-dlp' }, selectedTools[tool]))
+  handle(IP.revealDir, z.tuple([shapes.dir]), async ([dir]) => {
+    await permittedDir(dir)
+    if (dir) manager.revealDir(dir)
   })
-
-  handle(IP.chooseTorrent, async () => {
-    const win = getWindow()
-    const result = await dialog.showOpenDialog(win!, {
-      title: 'Open torrent file',
-      properties: ['openFile'],
-      filters: [
-        { name: 'Torrent files', extensions: ['torrent'] },
-        { name: 'All files', extensions: ['*'] }
-      ]
-    })
-    return result.canceled ? null : result.filePaths[0] || null
-  })
-
-  handle(IP.chooseCookies, async () => {
-    const win = getWindow()
-    const result = await dialog.showOpenDialog(win!, {
-      title: 'Select a cookies.txt file',
-      properties: ['openFile'],
-      filters: [
-        { name: 'Cookies file', extensions: ['txt'] },
-        { name: 'All files', extensions: ['*'] }
-      ]
-    })
-    return result.canceled ? null : result.filePaths[0] || null
-  })
-
-  handle(IP.revealDir, (dir: string) => manager.revealDir(dir))
-
-  handle(IP.openExternal, async (url: string) => {
-    if (!/^(https?:|mailto:)/i.test(url)) throw new Error('Blocked external URL')
-    await shell.openExternal(url)
-  })
-
-  handleQuiet(IP.checkUpdate, () => updater.check(manager.settings().githubToken))
-
-  handleQuiet(IP.downloadUpdate, (info: UpdateInfo) =>
-    updater.download(info, (received, total) => send({ type: 'update:progress', received, total }))
-  )
-
-  handleQuiet(IP.installUpdate, () => updater.install())
-
-  handleQuiet(IP.revealUpdate, () => updater.reveal())
-
-  handleQuiet(IP.resumeWithUrl, (id: string, url: string) => manager.resumeWithUrl(id, url))
-
-  handle(IP.windowControl, (action: 'minimize' | 'maximize' | 'close') => {
-    const win = getWindow()
-    if (!win) return
-    if (action === 'minimize') win.minimize()
-    else if (action === 'maximize') {
-      if (win.isMaximized()) win.unmaximize()
-      else win.maximize()
-    } else win.close()
-  })
+  handle(IP.openExternal, z.tuple([shapes.external]), ([url]) => shell.openExternal(url))
 }

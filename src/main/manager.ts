@@ -1,8 +1,7 @@
-import { Notification, app, nativeTheme, shell, clipboard } from 'electron'
+import { Notification, app, nativeTheme, shell, clipboard, session } from 'electron'
 import { randomUUID } from 'node:crypto'
-import { existsSync } from 'node:fs'
-import { promises as fs } from 'node:fs'
-import { basename, join, relative, isAbsolute } from 'node:path'
+import { existsSync, promises as fs } from 'node:fs'
+import { basename, join, isAbsolute } from 'node:path'
 import type {
   AddDownloadInput,
   AddTorrentInput,
@@ -29,10 +28,13 @@ import { HttpEngine, type EngineHost, type TaskHandle } from './engines/http'
 import { YoutubeEngine } from './engines/youtube'
 import { TorrentEngine } from './engines/torrent'
 import { applyLaunchAtStartup } from './autostart'
+import { atomicWrite, readLocalFile } from './durable-file'
+import { httpUrl, MAX_TORRENT_BYTES } from './validate'
 
 interface ManagerDeps {
   store: Store
   emit: (event: MainEvent) => void
+  openTaskView?: (id: string) => void
 }
 
 const ACTIVE: TaskStatus[] = ['connecting', 'downloading', 'verifying']
@@ -47,6 +49,15 @@ export class DownloadManager implements EngineHost {
   private emit: (event: MainEvent) => void
   private tasks = new Map<string, DownloadTask>()
   private controllers = new Map<string, AbortController>()
+  private pendingAdds = new Set<string>()
+  private runs = new Map<string, Promise<void>>()
+  private operations = new Map<string, Promise<unknown>>()
+  private operationAbort = new AbortController()
+  private sleeping = false
+  private offline = false
+  private reconnectTasks = new Set<string>()
+  private wakeTasks = new Set<string>()
+  private queuePaused = false
   private autoNames = new Set<string>()
   private resumeFlags = new Set<string>()
   private lastDownloaded = new Map<string, number>()
@@ -57,12 +68,15 @@ export class DownloadManager implements EngineHost {
     ffmpeg: { available: false } as { available: boolean; path?: string }
   }
   private shuttingDown = false
+  private shutdownResume = new Set<string>()
   private lastStatsEmit = 0
-  private torrentPayloads = new Map<string, { data?: Buffer; file?: number[] }>()
+  private openTaskView?: (id: string) => void
 
   constructor(deps: ManagerDeps) {
     this.store = deps.store
     this.emit = deps.emit
+    this.openTaskView = deps.openTaskView
+    this.store.onSaveError = () => this.toast('error', 'Pulse Mac could not save its state. Check the disk.')
     this.http = new HttpEngine(this)
     this.youtube = new YoutubeEngine(this)
     this.torrent = new TorrentEngine(this)
@@ -96,7 +110,6 @@ export class DownloadManager implements EngineHost {
     this.throttle.setLimit(this.store.settings.globalSpeedLimit)
     this.ticker = setInterval(() => this.tick(), 1000)
     void this.refreshTools()
-    void this.torrent.init().catch(() => undefined)
     if (this.store.settings.globalSpeedLimit > 0) {
       this.torrent.setLimit(this.store.settings.globalSpeedLimit)
     }
@@ -130,8 +143,8 @@ export class DownloadManager implements EngineHost {
     task.updatedAt = Date.now()
     if (patch.fileName && this.autoNames.has(task.id)) task.name = patch.fileName
     if (patch.fileName) task.category = categoryFor(patch.fileName)
-    if (!wasCompleted && task.status === 'completed') this.handleCompleted(task)
     this.persistSoon()
+    if (!wasCompleted && task.status === 'completed') this.handleCompleted(task)
     this.emit({ type: 'task:update', task })
     if (wasCompleted !== (task.status === 'completed')) this.emitStats(true)
   }
@@ -142,16 +155,17 @@ export class DownloadManager implements EngineHost {
     task.connections = 0
     if (this.store.settings.notifyOnComplete && Notification.isSupported()) {
       try {
-        new Notification({
-          title: 'Download complete',
-          body: task.name,
-          silent: false
-        }).show()
+        const notification = new Notification({
+          title: this.settings().language === 'fa' ? 'دانلود کامل شد' : 'Download complete',
+          body: task.name
+        })
+        notification.on('click', () => this.openTaskView?.(task.id))
+        notification.show()
       } catch {
         /* ignore */
       }
     }
-    void this.store.flush()
+    void this.store.flush().catch(() => this.store.onSaveError?.())
   }
 
   toast(level: 'info' | 'success' | 'error', message: string): void {
@@ -181,18 +195,15 @@ export class DownloadManager implements EngineHost {
     } catch {
       throw new Error('This does not look like a valid URL')
     }
-    const scheme = new URL(url).protocol
-    if (!['http:', 'https:', 'ftp:'].includes(scheme)) {
-      throw new Error(`Unsupported protocol: ${scheme}`)
-    }
+    url = httpUrl.parse(url)
 
     const kind: TaskKind =
       input.kind === 'youtube' || (input.kind !== 'http' && isYoutubeUrl(url))
         ? 'youtube'
         : 'http'
 
-    const dir = input.dir?.trim() || this.store.settings.downloadDir
-    await ensureDir(dir)
+    this.requireRunning()
+    const dir = await this.downloadDir(input.dir)
 
     const fallbackName = guessNameFromUrl(url)
     const fileName = sanitizeFileName(
@@ -218,6 +229,7 @@ export class DownloadManager implements EngineHost {
       createdAt: Date.now(),
       updatedAt: Date.now(),
       headers: input.headers,
+      checksum: input.checksum,
       thumbnail: input.thumbnail,
       maxConnections: input.connections,
       category: categoryFor(fileName),
@@ -243,18 +255,12 @@ export class DownloadManager implements EngineHost {
         playlistCount: input.youtube?.playlistCount
       }
     }
-    this.tasks.set(task.id, task)
-    this.lastDownloaded.set(task.id, 0)
-    this.emit({ type: 'task:add', task })
-    this.emitStats(true)
-    this.persistSoon()
-    this.schedule()
-    return task
+    return this.enqueue(task)
   }
 
   async addTorrent(input: AddTorrentInput): Promise<DownloadTask> {
-    const dir = input.dir?.trim() || this.store.settings.downloadDir
-    await ensureDir(dir)
+    this.requireRunning()
+    const dir = await this.downloadDir(input.dir)
     let name = input.name?.replace(/\.torrent$/i, '') || 'Torrent'
     let uri = input.uri?.trim() || ''
     if (/^magnet:/i.test(uri)) {
@@ -293,18 +299,74 @@ export class DownloadManager implements EngineHost {
         seeding: false
       }
     }
-    // Stash the base64 payload / picked path on a transient field consumed by startTask.
-    this.torrentPayloads.set(task.id, {
-      data: input.data ? Buffer.from(input.data, 'base64') : undefined,
-      file: input.fileIndices
+    if (input.data) {
+      const data = Buffer.from(input.data, 'base64')
+      if (!data.length || data.length > MAX_TORRENT_BYTES) throw new Error('Invalid torrent file size.')
+      const dir = join(app.getPath('userData'), 'torrents')
+      await fs.mkdir(dir, { recursive: true, mode: 0o700 })
+      const path = join(dir, `${task.id}.torrent`)
+      await atomicWrite(path, data)
+      task.torrent!.torrentFile = path
+    } else if (isAbsolute(uri)) {
+      throw new Error('Select the torrent file through the file picker.')
+    }
+    task.torrent!.fileIndices = input.fileIndices
+    return this.enqueue(task)
+  }
+
+  async addTorrentFile(path: string, input: AddTorrentInput = {}): Promise<DownloadTask> {
+    if (!/\.torrent$/i.test(path)) throw new Error('Choose a .torrent file.')
+    const data = await readLocalFile(path, MAX_TORRENT_BYTES)
+    return this.addTorrent({
+      ...input, uri: undefined, data: data.toString('base64'),
+      name: input.name || path.split('/').pop()
     })
+  }
+
+  private requireRunning(): void {
+    if (this.shuttingDown) throw new Error('Pulse Mac is quitting.')
+  }
+
+  private async downloadDir(path?: string): Promise<string> {
+    const dir = path?.trim() || this.store.settings.downloadDir
+    if (!isAbsolute(dir)) throw new Error('Choose an absolute download folder.')
+    await ensureDir(dir)
+    return fs.realpath(dir)
+  }
+
+  private async enqueue(task: DownloadTask): Promise<DownloadTask> {
+    this.requireRunning()
+    task.order = this.nextOrder()
+    this.pendingAdds.add(task.id)
     this.tasks.set(task.id, task)
     this.lastDownloaded.set(task.id, 0)
+    this.persistSoon()
+    try {
+      await this.store.flush()
+    } catch (error) {
+      this.tasks.delete(task.id)
+      this.lastDownloaded.delete(task.id)
+      this.persistSoon()
+      throw error
+    } finally {
+      this.pendingAdds.delete(task.id)
+    }
     this.emit({ type: 'task:add', task })
     this.emitStats(true)
-    this.persistSoon()
     this.schedule()
     return task
+  }
+
+  async resolveProxy(url: string): Promise<string | undefined> {
+    const proxy = this.settings().proxy
+    if (!proxy || proxy === 'direct') return undefined
+    if (proxy !== 'system') return proxy
+    const result = await session.defaultSession.resolveProxy(url)
+    const [kind, endpoint] = result.split(';')[0].trim().split(/\s+/)
+    if (kind === 'DIRECT') return undefined
+    const scheme = { PROXY: 'http', HTTPS: 'https', SOCKS5: 'socks5' }[kind]
+    if (!scheme || !endpoint) throw new Error('The system proxy type is unsupported.')
+    return `${scheme}://${endpoint}`
   }
 
   private nextOrder(): number {
@@ -317,8 +379,8 @@ export class DownloadManager implements EngineHost {
   }
 
   private schedule(): void {
-    if (this.shuttingDown) return
-    const active = [...this.tasks.values()].filter((t) => ACTIVE.includes(t.status)).length
+    if (this.shuttingDown || this.sleeping || this.offline || this.queuePaused) return
+    const active = this.runs.size
     const limit = Math.max(1, this.store.settings.maxConcurrent)
     let slots = limit - active
     if (slots <= 0) return
@@ -327,9 +389,16 @@ export class DownloadManager implements EngineHost {
       .sort((a, b) => a.order - b.order)
     for (const task of queued) {
       if (slots <= 0) break
-      if (this.controllers.has(task.id)) continue
+      if (this.pendingAdds.has(task.id) || this.runs.has(task.id) || this.operations.has(task.id)) continue
       slots--
-      void this.startTask(task)
+      const run = Promise.resolve().then(async () => {
+        if (task.status === 'queued') await this.startTask(task)
+      }).finally(() => {
+        this.runs.delete(task.id)
+        this.schedule()
+        this.emitStats(true)
+      })
+      this.runs.set(task.id, run)
     }
   }
 
@@ -358,18 +427,12 @@ export class DownloadManager implements EngineHost {
           thumbnail: !!yt?.embedThumbnail
         })
       } else {
-        const payload = this.torrentPayloads.get(task.id)
-        this.torrentPayloads.delete(task.id)
-        await this.torrent.startOrResume(handle, {
-          uri: task.url,
-          data: payload?.data,
-          torrentFile: task.torrent?.torrentFile,
-          sequential: task.torrent?.sequential ?? true,
-          fileIndices: payload?.file
-        })
+        await this.torrent.startOrResume(handle)
       }
     } catch (err) {
-      if (!controller.signal.aborted) {
+      if (controller.signal.aborted && task.status !== 'completed') {
+        this.patch(task, { status: 'paused', speed: 0, eta: 0, connections: 0 })
+      } else if (!controller.signal.aborted) {
         this.patch(task, {
           status: 'error',
           error: (err as Error).message || 'Download failed',
@@ -381,180 +444,183 @@ export class DownloadManager implements EngineHost {
     } finally {
       this.controllers.delete(task.id)
       this.resumeFlags.delete(task.id)
-      if (task.status === 'downloading' || task.status === 'connecting') {
-        if (task.kind !== 'torrent' || this.torrent.status() !== 'ready') {
-          // Engine returned without an explicit terminal state.
-          if (!controller.signal.aborted) this.patch(task, { status: 'paused' })
-        }
-      }
+      if (ACTIVE.includes(task.status)) this.patch(task, { status: 'paused', speed: 0, eta: 0, connections: 0 })
       this.lastDownloaded.set(task.id, task.downloaded)
+    }
+  }
+
+  private operate<T>(id: string, action: (task: DownloadTask) => Promise<T>, missing: T): Promise<T> {
+    this.requireRunning()
+    const previous = this.operations.get(id) ?? Promise.resolve()
+    const run = previous.catch(() => undefined).then(async () => {
+      const task = this.tasks.get(id)
+      return task ? action(task) : missing
+    }).finally(() => {
+      if (this.operations.get(id) === run) this.operations.delete(id)
       this.schedule()
-      this.emitStats(true)
-    }
-  }
-
-  pause(id: string): void {
-    const task = this.tasks.get(id)
-    if (!task) return
-    if (!ACTIVE.includes(task.status) && task.status !== 'queued') return
-    this.resumeFlags.add(id)
-    this.controllers.get(id)?.abort()
-    if (task.kind === 'torrent') this.torrent.pause(id)
-    if (task.kind === 'youtube') this.youtube.stop(id)
-    if (task.status === 'queued') {
-      this.patch(task, { status: 'paused', speed: 0, eta: 0, connections: 0 })
-    }
-    this.persistSoon()
-  }
-
-  async resume(id: string): Promise<void> {
-    const task = this.tasks.get(id)
-    if (!task) return
-    if (!RESUMABLE.includes(task.status)) return
-    this.resumeFlags.add(id)
-    this.patch(task, {
-      status: 'queued',
-      error: undefined,
-      speed: 0,
-      eta: 0,
-      connections: 0
     })
-    this.schedule()
+    this.operations.set(id, run)
+    return run
   }
 
-  /**
-   * Continue an interrupted HTTP download with a freshly issued URL. Only the
-   * source changes: the destination, partial file and byte offsets are kept, so
-   * links that expire mid-download can be replaced without losing progress.
-   */
-  async resumeWithUrl(id: string, rawUrl: string): Promise<ResumeWithUrlResult> {
-    const task = this.tasks.get(id)
-    if (!task) return { ok: false, error: 'Download not found.' }
-    if (task.kind !== 'http') {
-      return { ok: false, error: 'Only direct HTTP downloads can use a new link.' }
-    }
-    if (task.status === 'completed') {
-      return { ok: false, error: 'This download is already complete.' }
-    }
-    const trimmed = (rawUrl || '').trim()
-    let url: string
-    try {
-      url = new URL(trimmed).toString()
-    } catch {
-      return { ok: false, error: 'Enter a valid HTTP or HTTPS link.' }
-    }
-    if (!/^https?:$/.test(new URL(url).protocol)) {
-      return { ok: false, error: 'Enter a valid HTTP or HTTPS link.' }
-    }
-    if (ACTIVE.includes(task.status)) {
-      this.controllers.get(id)?.abort()
-      // Let the running engine unwind and persist its final sidecar state
-      // before the metadata is rewritten for the new link.
-      for (let i = 0; i < 50 && this.controllers.has(id); i++) {
-        await new Promise((resolve) => setTimeout(resolve, 100))
+  private async stop(task: DownloadTask): Promise<void> {
+    this.controllers.get(task.id)?.abort()
+    if (task.kind === 'torrent') this.torrent.pause(task.id)
+    if (task.kind === 'youtube') this.youtube.stop(task.id)
+    await this.runs.get(task.id)
+  }
+
+  pause(id: string): Promise<void> {
+    return this.operate(id, async (task) => {
+      if (!ACTIVE.includes(task.status) && task.status !== 'queued') return
+      await this.stop(task)
+      if (task.status !== 'completed') this.patch(task, { status: 'paused', speed: 0, eta: 0, connections: 0 })
+      await this.store.flush()
+    }, undefined)
+  }
+
+  resume(id: string, unpauseQueue = true): Promise<void> {
+    if (unpauseQueue) this.queuePaused = false
+    return this.operate(id, async (task) => {
+      if (!RESUMABLE.includes(task.status)) return
+      if (!task.url) throw new Error('Unlock the macOS Keychain and reopen Pulse Mac, or supply a new link.')
+      this.resumeFlags.add(id)
+      this.patch(task, { status: 'queued', error: undefined, speed: 0, eta: 0, connections: 0 })
+      await this.store.flush()
+    }, undefined)
+  }
+
+  resumeWithUrl(id: string, rawUrl: string): Promise<ResumeWithUrlResult> {
+    return this.operate<ResumeWithUrlResult>(id, async (task) => {
+      if (task.kind !== 'http' || task.status === 'completed') {
+        return { ok: false, error: 'Only unfinished HTTP downloads can use a new link.' }
       }
-      if (this.controllers.has(id)) {
-        return { ok: false, error: 'Could not stop the current download. Pause it first.' }
-      }
-    }
-    const prepared = await this.http.resumeWithUrl(task, url)
-    if (!prepared.ok) return { ok: false, error: prepared.error }
-    const restarted = !!prepared.restarted
-    this.patch(task, {
-      url,
-      status: 'queued',
-      error: undefined,
-      linkExpired: false,
-      speed: 0,
-      eta: 0,
-      connections: 0,
-      downloaded: restarted ? 0 : task.downloaded,
-      segments: restarted ? undefined : task.segments,
-      size: restarted ? prepared.size || 0 : task.size || prepared.size || 0,
-      resumable: restarted ? undefined : task.resumable
-    })
-    this.resumeFlags.add(id)
-    this.schedule()
-    return { ok: true, restarted }
-  }
-
-  async cancel(id: string): Promise<void> {
-    const task = this.tasks.get(id)
-    if (!task) return
-    this.controllers.get(id)?.abort()
-    if (task.kind === 'torrent') {
-      this.torrent.pause(id)
-      await this.torrent.remove(id)
-    }
-    if (task.kind === 'youtube') this.youtube.stop(id)
-    this.patch(task, {
-      status: 'paused',
-      speed: 0,
-      eta: 0,
-      connections: 0
-    })
-  }
-
-  async remove(id: string, deleteFile: boolean): Promise<void> {
-    const task = this.tasks.get(id)
-    if (!task) return
-    this.controllers.get(id)?.abort()
-    this.controllers.delete(id)
-    if (task.kind === 'torrent') await this.torrent.remove(id)
-    if (task.kind === 'youtube') this.youtube.stop(id)
-    this.tasks.delete(id)
-    this.lastDownloaded.delete(id)
-    this.autoNames.delete(id)
-    this.resumeFlags.delete(id)
-    if (deleteFile) await this.deleteFiles(task)
-    this.emit({ type: 'task:remove', id })
-    this.persistSoon()
-    this.emitStats(true)
-    this.schedule()
-  }
-
-  private safeInside(dir: string, target: string): boolean {
-    const rel = relative(dir, target)
-    return !!rel && !rel.startsWith('..') && !isAbsolute(rel)
-  }
-
-  private async deleteFiles(task: DownloadTask): Promise<void> {
-    const targets = new Set<string>()
-    if (task.filePath) targets.add(task.filePath)
-    if (task.kind === 'http') {
-      if (task.filePath) {
-        targets.add(`${task.filePath}.pulse-part`)
-        targets.add(`${task.filePath}.pulse-meta`)
-      }
-      if (!task.filePath) {
-        const guess = join(task.dir, task.fileName)
-        targets.add(guess)
-        targets.add(`${guess}.pulse-part`)
-        targets.add(`${guess}.pulse-meta`)
-      }
-    }
-    for (const target of targets) {
-      if (!this.safeInside(task.dir, target)) continue
+      const url = httpUrl.parse(rawUrl.trim())
+      await this.stop(task)
+      if (this.get(id)?.status === 'completed') return { ok: false, error: 'This download is already complete.' }
       try {
-        await fs.rm(target, { recursive: true, force: true })
+        const { size, restarted } = await this.http.resumeWithUrl(task, url, this.operationAbort.signal)
+        this.patch(task, {
+          url, status: 'queued', error: undefined, linkExpired: false, speed: 0, eta: 0, connections: 0,
+          downloaded: restarted ? 0 : task.downloaded, segments: restarted ? undefined : task.segments, size
+        })
+        await this.store.flush()
+        return { ok: true, restarted }
       } catch {
-        /* ignore */
+        return { ok: false, error: 'Could not use the replacement link. Your partial file was preserved.' }
       }
+    }, { ok: false, error: 'Download not found.' })
+  }
+
+  cancel(id: string): Promise<void> {
+    return this.operate(id, async (task) => {
+      if (task.status === 'completed') return
+      await this.stop(task)
+      if (task.kind === 'torrent') await this.torrent.remove(id)
+      if (this.get(id)?.status !== 'completed') this.patch(task, { status: 'canceled', speed: 0, eta: 0, connections: 0 })
+      await this.store.flush()
+    }, undefined)
+  }
+
+  remove(id: string, deleteFile: boolean): Promise<void> {
+    return this.operate(id, async (task) => {
+      await this.stop(task)
+      if (task.kind === 'torrent') await this.torrent.remove(id)
+      if (deleteFile) {
+        if (task.kind === 'http') await this.http.deleteOwnedFiles(task)
+        else throw new Error('Remove this download from the list, then delete its files in Finder.')
+      }
+      this.tasks.delete(id)
+      this.lastDownloaded.delete(id)
+      this.autoNames.delete(id)
+      this.resumeFlags.delete(id)
+      this.emit({ type: 'task:remove', id })
+      this.persistSoon()
+      await this.store.flush()
+      this.emitStats(true)
+    }, undefined)
+  }
+
+  prioritize(id: string): Promise<void> {
+    return this.operate(id, async (task) => {
+      if (task.status !== 'queued') return
+      const order = this.list().reduce((min, item) => Math.min(min, item.order), 0) - 1
+      this.patch(task, { order })
+      await this.store.flush()
+    }, undefined)
+  }
+
+  selectTorrentFiles(id: string, indices: number[]): Promise<void> {
+    return this.operate(id, async (task) => {
+      if (!task.torrent || task.status === 'completed') return
+      if (indices.some((index) => index >= task.torrent!.files.length)) throw new Error('Invalid file selection.')
+      this.patch(task, { torrent: { ...task.torrent, fileIndices: indices } })
+      this.torrent.selectFiles(id, indices)
+      await this.store.flush()
+    }, undefined)
+  }
+
+  async networkChanged(online: boolean): Promise<void> {
+    if (this.shuttingDown || this.offline === !online) return
+    this.offline = !online
+    if (!online) {
+      this.reconnectTasks = new Set(this.list().filter((task) => ACTIVE.includes(task.status)).map((task) => task.id))
+      await Promise.all([...this.reconnectTasks].map((id) => this.pause(id)))
+      return
+    }
+    const interrupted = [...this.reconnectTasks]
+    this.reconnectTasks.clear()
+    if (this.settings().autoResume && !this.queuePaused) {
+      await Promise.all(interrupted.map((id) => this.resume(id, false)))
+    }
+    this.schedule()
+  }
+
+  retry(id: string): Promise<void> { return this.resume(id) }
+
+  async pauseAll(): Promise<void> {
+    this.queuePaused = true
+    try {
+      await Promise.all(this.list().map((task) => this.pause(task.id)))
+    } catch {
+      this.store.onSaveError?.()
     }
   }
 
-  async retry(id: string): Promise<void> {
-    const task = this.tasks.get(id)
-    if (!task) return
-    this.resumeFlags.add(id)
-    this.patch(task, {
-      status: 'queued',
-      error: undefined,
-      speed: 0,
-      eta: 0,
-      connections: 0
-    })
-    this.schedule()
+  async resumeAll(): Promise<void> {
+    this.queuePaused = true
+    try {
+      await Promise.all(this.list().filter((task) => task.status === 'paused').map((task) => this.resume(task.id, false)))
+    } catch {
+      this.store.onSaveError?.()
+    } finally {
+      this.queuePaused = false
+      this.schedule()
+    }
+  }
+
+  async suspend(): Promise<void> {
+    this.sleeping = true
+    this.wakeTasks = new Set(this.list().filter((task) => ACTIVE.includes(task.status)).map((task) => task.id))
+    try {
+      await Promise.all([...this.wakeTasks].map((id) => this.pause(id)))
+    } catch {
+      this.store.onSaveError?.()
+    }
+  }
+
+  async wake(): Promise<void> {
+    try {
+      if (this.settings().autoResume && !this.queuePaused) {
+        await Promise.all([...this.wakeTasks].map((id) => this.resume(id, false)))
+      }
+    } catch {
+      this.store.onSaveError?.()
+    } finally {
+      this.wakeTasks.clear()
+      this.sleeping = false
+      this.schedule()
+    }
   }
 
   reveal(id: string): void {
@@ -568,8 +634,9 @@ export class DownloadManager implements EngineHost {
   async open(id: string): Promise<void> {
     const task = this.tasks.get(id)
     if (!task) return
-    const target = task.filePath || join(task.dir, task.fileName)
-    if (existsSync(target)) {
+    if (task.status !== 'completed') return
+    const target = task.filePath
+    if (target && existsSync(target)) {
       const err = await shell.openPath(target)
       if (err) this.toast('error', `Could not open the file: ${err}`)
     } else {
@@ -590,21 +657,17 @@ export class DownloadManager implements EngineHost {
   }
 
   updateSettings(patch: Partial<Settings>): Settings {
-    const prev = this.store.settings
+    if (patch.launchAtStartup !== undefined) {
+      patch = { ...patch, launchAtStartup: applyLaunchAtStartup(patch.launchAtStartup) }
+    }
     const settings = this.store.patchSettings(patch)
-    if (patch.globalSpeedLimit !== undefined) {
+    if (patch.globalSpeedLimit !== undefined || patch.seedAfterComplete !== undefined) {
       this.throttle.setLimit(settings.globalSpeedLimit)
       this.torrent.setLimit(settings.globalSpeedLimit)
     }
     if (patch.maxConcurrent !== undefined) this.schedule()
-    if (patch.downloadDir && patch.downloadDir !== prev.downloadDir) {
-      void ensureDir(settings.downloadDir)
-    }
     if (patch.ytDlpPath !== undefined || patch.ffmpegPath !== undefined) {
-      void this.refreshTools()
-    }
-    if (patch.launchAtStartup !== undefined) {
-      void applyLaunchAtStartup(settings.launchAtStartup)
+      void this.rescanTools()
     }
     if (patch.theme !== undefined) {
       nativeTheme.themeSource = settings.theme
@@ -619,6 +682,7 @@ export class DownloadManager implements EngineHost {
   }
 
   private tick(): void {
+    if (!this.runs.size && !this.list().some((task) => task.torrent?.seeding)) return
     const now = Date.now()
     for (const task of this.tasks.values()) {
       const last = this.lastDownloaded.get(task.id) ?? task.downloaded
@@ -673,17 +737,24 @@ export class DownloadManager implements EngineHost {
   }
 
   async shutdown(): Promise<void> {
+    if (!this.shuttingDown) this.shutdownResume = new Set(this.list().filter((task) => ACTIVE.includes(task.status)).map((task) => task.id))
     this.shuttingDown = true
     if (this.ticker) clearInterval(this.ticker)
     this.ticker = null
+    this.operationAbort.abort()
     for (const controller of this.controllers.values()) controller.abort()
+    await Promise.allSettled([this.youtube.shutdown(), ...this.operations.values(), ...this.runs.values()])
+    await this.torrent.destroy()
+    await this.http.shutdown()
     for (const task of this.tasks.values()) {
-      if (ACTIVE.includes(task.status)) task.status = 'paused'
+      if ((ACTIVE.includes(task.status) || task.status === 'paused') && this.shutdownResume.has(task.id)) {
+        task.status = this.settings().autoResume ? 'queued' : 'paused'
+      }
       task.speed = 0
       task.eta = 0
       task.connections = 0
     }
-    await this.torrent.destroy()
+    this.persistSoon()
     await this.store.flush()
   }
 

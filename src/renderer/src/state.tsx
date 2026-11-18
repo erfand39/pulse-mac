@@ -14,7 +14,6 @@ import type {
   GlobalStats,
   MainEvent,
   Settings,
-  UpdateInfo
 } from '@shared/types'
 import type { Lang } from './i18n'
 import { dictionaries, type Dict } from './i18n'
@@ -40,7 +39,6 @@ export type ViewId =
 
 export type SortId = 'newest' | 'oldest' | 'size' | 'name' | 'progress'
 
-export type UpdatePhase = 'idle' | 'checking' | 'downloading' | 'ready' | 'error'
 
 export type ToastLevel = 'info' | 'success' | 'error'
 
@@ -90,17 +88,6 @@ interface AppContextValue {
   maximized: boolean
   refreshTools: () => void
   patchSettings: (patch: Partial<Settings>) => void
-  updateInfo: UpdateInfo | null
-  updatePhase: UpdatePhase
-  updateProgress: { received: number; total: number } | null
-  updateError: string | null
-  updatePath: string | null
-  updateOpen: boolean
-  setUpdateOpen: (open: boolean) => void
-  checkUpdates: (opts?: { silent?: boolean }) => Promise<void>
-  downloadUpdate: () => Promise<void>
-  installUpdate: () => Promise<void>
-  revealUpdate: () => Promise<void>
   newLinkId: string | null
   openNewLink: (id: string) => void
   closeNewLink: () => void
@@ -111,9 +98,10 @@ const fallbackSettings: Settings = {
   maxConcurrent: 3,
   connections: 8,
   globalSpeedLimit: 0,
-  language: 'en',
-  theme: 'light',
-  clipboardWatch: true,
+  language: 'fa',
+  theme: 'system',
+  clipboardWatch: false,
+  keepRunningOnClose: true,
   notifyOnComplete: true,
   ytDlpPath: '',
   ffmpegPath: '',
@@ -122,10 +110,10 @@ const fallbackSettings: Settings = {
   proxy: '',
   userAgent: '',
   autoResume: true,
-  launchAtStartup: true,
+  launchAtStartup: false,
   cookiesBrowser: '',
   cookiesFile: '',
-  githubToken: ''
+  githubTokenConfigured: false
 }
 
 const AppCtx = createContext<AppContextValue | null>(null)
@@ -146,12 +134,6 @@ export function AppProvider({ children }: { children: ReactNode }): React.JSX.El
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [toasts, setToasts] = useState<ToastItem[]>([])
   const [maximized, setMaximized] = useState(false)
-  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
-  const [updatePhase, setUpdatePhase] = useState<UpdatePhase>('idle')
-  const [updateProgress, setUpdateProgress] = useState<{ received: number; total: number } | null>(null)
-  const [updateError, setUpdateError] = useState<string | null>(null)
-  const [updatePath, setUpdatePath] = useState<string | null>(null)
-  const [updateOpen, setUpdateOpen] = useState(false)
   const [newLinkId, setNewLinkId] = useState<string | null>(null)
   const timers = useRef(new Map<string, ReturnType<typeof setTimeout>>())
   const langRef = useRef<Lang>(settings.language)
@@ -226,9 +208,6 @@ export function AppProvider({ children }: { children: ReactNode }): React.JSX.El
         case 'toast':
           pushToast(event.level, event.message)
           break
-        case 'update:progress':
-          setUpdateProgress({ received: event.received, total: event.total })
-          break
         case 'clipboard:url':
           pushToast('info', dictionaries[langRef.current].toast.clipboard, {
             ttl: 9000,
@@ -253,9 +232,12 @@ export function AppProvider({ children }: { children: ReactNode }): React.JSX.El
           openAdd({ url: event.url })
           break
         case 'navigate':
+          setSettingsOpen(true)
+          window.dispatchEvent(new CustomEvent('pulse-settings', { detail: event.view }))
           break
-        case 'window:state':
-          setMaximized(event.maximized)
+        case 'select-task':
+          setView('all')
+          setSelectedId(event.id)
           break
         default:
           break
@@ -289,84 +271,8 @@ export function AppProvider({ children }: { children: ReactNode }): React.JSX.El
   const t = dictionaries[lang] ?? dictionaries.en
   const dir = lang === 'fa' ? 'rtl' : 'ltr'
 
-  const checkUpdates = useCallback(
-    async (opts?: { silent?: boolean }): Promise<void> => {
-      setUpdatePhase('checking')
-      setUpdateError(null)
-      try {
-        const info = await window.pulse.checkUpdate()
-        setUpdateInfo(info)
-        setUpdatePhase('idle')
-        if (!info.hasUpdate) {
-          if (!opts?.silent) pushToast('success', t.settings.about.upToDate)
-          return
-        }
-        setUpdatePath(null)
-        if (opts?.silent) {
-          pushToast('info', t.toast.updateAvailable.replace('{version}', info.latest), {
-            ttl: 12000,
-            actionLabel: t.toast.viewUpdate,
-            action: () => setUpdateOpen(true)
-          })
-        } else {
-          setUpdateOpen(true)
-        }
-      } catch (err) {
-        setUpdatePhase('error')
-        const message = cleanIpcError(err, t.settings.about.updateFailed)
-        setUpdateError(message)
-        if (!opts?.silent) pushToast('error', message)
-      }
-    },
-    [pushToast, t]
-  )
-
-  const downloadUpdate = useCallback(async (): Promise<void> => {
-    if (!updateInfo) return
-    setUpdatePhase('downloading')
-    setUpdateError(null)
-    setUpdateProgress({ received: 0, total: updateInfo.asset?.size ?? 0 })
-    try {
-      const result = await window.pulse.downloadUpdate(updateInfo)
-      if (!result.ok) {
-        setUpdatePhase('error')
-        setUpdateError(result.error || t.settings.about.updateFailed)
-        return
-      }
-      setUpdatePath(result.path || null)
-      setUpdatePhase('ready')
-    } catch (err) {
-      setUpdatePhase('error')
-      setUpdateError(cleanIpcError(err, t.settings.about.updateFailed))
-    }
-  }, [updateInfo, t])
-
-  const installUpdate = useCallback(async (): Promise<void> => {
-    try {
-      await window.pulse.installUpdate()
-    } catch (err) {
-      setUpdatePhase('error')
-      setUpdateError(cleanIpcError(err, t.settings.about.updateFailed))
-    }
-  }, [t])
-
-  const revealUpdate = useCallback(async (): Promise<void> => {
-    try {
-      await window.pulse.revealUpdate()
-    } catch (err) {
-      pushToast('error', cleanIpcError(err, t.settings.about.updateFailed))
-    }
-  }, [pushToast, t])
-
   const openNewLink = useCallback((id: string): void => setNewLinkId(id), [])
   const closeNewLink = useCallback((): void => setNewLinkId(null), [])
-
-  const startupChecked = useRef(false)
-  useEffect(() => {
-    if (!ready || startupChecked.current) return
-    startupChecked.current = true
-    void checkUpdates({ silent: true })
-  }, [ready, checkUpdates])
 
   useEffect(() => {
     document.documentElement.lang = lang
@@ -374,7 +280,14 @@ export function AppProvider({ children }: { children: ReactNode }): React.JSX.El
   }, [lang, dir])
 
   useEffect(() => {
-    document.documentElement.dataset.theme = settings.theme
+    const light = window.matchMedia('(prefers-color-scheme: light)')
+    const apply = (): void => {
+      document.documentElement.dataset.theme =
+        settings.theme === 'system' ? (light.matches ? 'light' : 'dark') : settings.theme
+    }
+    apply()
+    light.addEventListener('change', apply)
+    return () => light.removeEventListener('change', apply)
   }, [settings.theme])
 
   useEffect(() => {
@@ -437,17 +350,6 @@ export function AppProvider({ children }: { children: ReactNode }): React.JSX.El
     maximized,
     refreshTools,
     patchSettings,
-    updateInfo,
-    updatePhase,
-    updateProgress,
-    updateError,
-    updatePath,
-    updateOpen,
-    setUpdateOpen,
-    checkUpdates,
-    downloadUpdate,
-    installUpdate,
-    revealUpdate,
     newLinkId,
     openNewLink,
     closeNewLink

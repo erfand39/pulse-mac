@@ -99,7 +99,7 @@ export function AddDownloadModal(): React.JSX.Element {
   const [advanced, setAdvanced] = useState(false)
   const [referer, setReferer] = useState('')
   const [ua, setUa] = useState('')
-  const [cookie, setCookie] = useState('')
+  const [checksum, setChecksum] = useState('')
   const [subtitles, setSubtitles] = useState(false)
   const [embedThumb, setEmbedThumb] = useState(false)
   const [torrentPath, setTorrentPath] = useState<string | null>(null)
@@ -130,7 +130,7 @@ export function AddDownloadModal(): React.JSX.Element {
     setAdvanced(false)
     setReferer('')
     setUa('')
-    setCookie('')
+    setChecksum('')
     setSubtitles(false)
     setEmbedThumb(false)
     setTorrentPath(null)
@@ -245,6 +245,10 @@ export function AddDownloadModal(): React.JSX.Element {
       setTorrentData(null)
       const existing = tasks.find((x) => x.kind === 'torrent' && x.name === name)
       if (existing) setError(null)
+      return
+    }
+    if (file.size > 1024 * 1024) {
+      setError(t.add.errorTorrent)
       return
     }
     const buffer = await file.arrayBuffer()
@@ -393,7 +397,7 @@ export function AddDownloadModal(): React.JSX.Element {
     try {
       if (tab === 'link') {
         const target = url.trim()
-        if (!/^https?:\/\//i.test(target) && !/^ftp:\/\//i.test(target)) {
+        if (!/^https?:\/\//i.test(target)) {
           setError(t.add.errorUrl)
           setBusy(false)
           return
@@ -401,11 +405,15 @@ export function AddDownloadModal(): React.JSX.Element {
         const headers: Record<string, string> = {}
         if (referer.trim()) headers.Referer = referer.trim()
         if (ua.trim()) headers['User-Agent'] = ua.trim()
-        if (cookie.trim()) headers.Cookie = cookie.trim()
+        if (checksum.trim() && !/^[a-f0-9]{64}$/i.test(checksum.trim())) {
+          setError(lang === 'fa' ? 'SHA-256 باید ۶۴ رقم هگزادسیمال باشد.' : 'Enter a 64-digit hexadecimal SHA-256 checksum.')
+          return
+        }
         const task = await window.pulse.addDownload({
           url: target,
           kind: 'http',
           fileName: fileName.trim() || undefined,
+          checksum: checksum.trim() || undefined,
           dir,
           connections,
           headers: Object.keys(headers).length ? headers : undefined
@@ -649,7 +657,7 @@ export function AddDownloadModal(): React.JSX.Element {
               <input
                 type="range"
                 min={1}
-                max={32}
+                max={16}
                 value={connections}
                 onChange={(e) => setConnections(Number(e.target.value))}
                 aria-label={t.add.connections}
@@ -675,8 +683,8 @@ export function AddDownloadModal(): React.JSX.Element {
                 <Labeled label={t.add.userAgent} small>
                   <input value={ua} onChange={(e) => setUa(e.target.value)} aria-label={t.add.userAgent} className="field h-8 w-full px-2 text-[10.5px]" dir="ltr" />
                 </Labeled>
-                <Labeled label={t.add.cookie} small>
-                  <input value={cookie} onChange={(e) => setCookie(e.target.value)} aria-label={t.add.cookie} className="field h-8 w-full px-2 text-[10.5px]" dir="ltr" />
+                <Labeled label={lang === 'fa' ? 'SHA-256 (اختیاری)' : 'SHA-256 (optional)'} small>
+                  <input value={checksum} onChange={(e) => setChecksum(e.target.value)} aria-label="SHA-256" maxLength={64} className="field h-8 w-full px-2 text-[10.5px]" dir="ltr" />
                 </Labeled>
               </div>
             ) : null}
@@ -1065,7 +1073,7 @@ export function AddDownloadModal(): React.JSX.Element {
                 <input
                   type="range"
                   min={1}
-                  max={32}
+                  max={16}
                   value={connections}
                   onChange={(e) => setConnections(Number(e.target.value))}
                   aria-label={t.add.connections}

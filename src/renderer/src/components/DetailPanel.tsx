@@ -56,6 +56,7 @@ export function DetailPanel(): React.JSX.Element {
   const active = task.status === 'downloading'
   const tone =
     task.status === 'completed' ? 'ok' : task.status === 'error' ? 'bad' : task.status === 'paused' ? 'warn' : 'brand'
+  const selectedIndices = task.torrent?.files.flatMap((entry, index) => entry.selected ? [index] : []) ?? []
   const thumb = task.thumbnail || task.youtube?.thumbnail
 
   const copy = async (text: string): Promise<void> => {
@@ -68,7 +69,14 @@ export function DetailPanel(): React.JSX.Element {
   }
 
   return (
-    <aside className="hidden w-[330px] shrink-0 flex-col border-s border-line/70 bg-panel lg:flex">
+    <aside className="z-20 flex w-[330px] shrink-0 flex-col overflow-hidden border-s border-line/70 bg-panel max-lg:absolute max-lg:inset-y-0 max-lg:end-0 max-lg:shadow-lg">
+      {task.status === 'queued' && (
+        <button type="button" className="btn btn-soft mx-4 mt-3 self-start" onClick={() => {
+          void window.pulse.prioritizeTask(task.id).catch(() => pushToast('error', t.add.errorProbe))
+        }}>
+          {lang === 'fa' ? 'انتقال به ابتدای صف' : 'Move to front of queue'}
+        </button>
+      )}
       <div className="flex shrink-0 items-center justify-between px-4 pb-2 pt-3.5">
         <div className="text-[10.5px] font-semibold text-muted">
           {t.detail.title}
@@ -268,6 +276,17 @@ export function DetailPanel(): React.JSX.Element {
                   return (
                     <div key={i} className="rounded-lg border border-line/60 bg-elev/30 px-2 py-1.5">
                       <div className="flex items-center gap-1.5 text-[10px]">
+                        {task.status !== 'completed' && (
+                          <input
+                            type="checkbox"
+                            checked={file.selected}
+                            disabled={file.selected && selectedIndices.length === 1}
+                            aria-label={file.name}
+                            onChange={() => void window.pulse.selectTorrentFiles(
+                              task.id, file.selected ? selectedIndices.filter((index) => index !== i) : [...selectedIndices, i]
+                            ).catch(() => pushToast('error', t.add.errorTorrent))}
+                          />
+                        )}
                         <span className="truncate" dir="auto">
                           {file.name}
                         </span>

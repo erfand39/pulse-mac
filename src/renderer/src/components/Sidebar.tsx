@@ -65,7 +65,7 @@ export function Sidebar(): React.JSX.Element {
   const free = system?.freeDisk || 0
 
   return (
-    <aside className="flex w-[236px] shrink-0 flex-col border-e border-line/70 bg-panel">
+    <aside className="flex w-[160px] xl:w-[236px] shrink-0 flex-col border-e border-line/70 bg-panel">
       <nav className="scroll-y flex-1 px-2.5 py-3.5">
         <Section title={t.nav.library}>
           <Item icon={<LayoutGrid size={16} />} label={t.nav.all} count={counts.all} active={view === 'all'} onClick={() => setView('all')} />

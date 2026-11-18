@@ -1,5 +1,4 @@
-import { app } from 'electron'
-import { existsSync, promises as fs } from 'node:fs'
+import { promises as fs } from 'node:fs'
 import { dirname, basename, extname, join } from 'node:path'
 import { isVideoPlatformUrl } from '@shared/urls'
 
@@ -18,9 +17,15 @@ export function sanitizeFileName(input: string, fallback = 'download'): string {
       name = `_${name}`
     }
   }
-  if (name.length > 180) {
+  if (Buffer.byteLength(name) > 220) {
     const ext = extname(name).slice(0, 12)
-    name = name.slice(0, 180 - ext.length) + ext
+    const stem = name.slice(0, name.length - extname(name).length)
+    let truncated = ''
+    for (const char of stem) {
+      if (Buffer.byteLength(truncated + char + ext) > 220) break
+      truncated += char
+    }
+    name = (truncated || fallback) + ext
   }
   return name
 }
@@ -102,27 +107,6 @@ export function extFromMime(mime?: string): string | undefined {
   return map[mime.split(';')[0].trim().toLowerCase()]
 }
 
-/** Returns a path that does not exist yet, appending " (n)" before the extension. */
-export async function uniquePath(dir: string, fileName: string): Promise<string> {
-  const ext = extname(fileName)
-  const stem = fileName.slice(0, fileName.length - ext.length)
-  let candidate = join(dir, fileName)
-  let i = 1
-  while (existsSync(candidate)) {
-    candidate = join(dir, `${stem} (${i})${ext}`)
-    i++
-  }
-  return candidate
-}
-
-export function defaultDownloadDir(): string {
-  try {
-    return join(app.getPath('downloads'))
-  } catch {
-    return process.cwd()
-  }
-}
-
 export const VIDEO_EXT = new Set([
   '.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv', '.m4v', '.ts', '.wmv', '.mpg', '.mpeg'
 ])
@@ -162,61 +146,49 @@ export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
-export function safeJsonParse<T>(text: string, fallback: T): T {
-  try {
-    return JSON.parse(text) as T
-  } catch {
-    return fallback
-  }
-}
-
-/** Shared token bucket applying the global speed limit across every HTTP segment. */
 export class GlobalThrottle {
   private limit = 0
-  private budget = 0
-  private last = Date.now()
   private chain: Promise<void> = Promise.resolve()
+  private changed = new AbortController()
 
   setLimit(bytesPerSecond: number): void {
-    this.limit = Math.max(0, bytesPerSecond)
-    if (!this.limit) this.budget = 0
-    this.last = Date.now()
+    const limit = Math.max(0, bytesPerSecond)
+    if (limit === this.limit) return
+    this.limit = limit
+    this.changed.abort()
+    this.changed = new AbortController()
   }
 
-  getLimit(): number {
-    return this.limit
-  }
+  getLimit(): number { return this.limit }
 
   consume(bytes: number, signal?: AbortSignal): Promise<void> {
     if (!this.limit) return Promise.resolve()
-    // Serialise consumption so the bucket stays accurate with many connections.
     const run = this.chain.then(async () => {
-      if (!this.limit) return
-      const now = Date.now()
-      this.budget = Math.min(this.limit, this.budget + ((now - this.last) / 1000) * this.limit)
-      this.last = now
-      this.budget -= bytes
-      if (this.budget < 0) {
-        const wait = Math.min(2000, (-this.budget / this.limit) * 1000)
-        await sleep(wait, signal)
+      let remaining = bytes
+      while (this.limit && remaining > 0) {
+        signal?.throwIfAborted()
+        const rate = this.limit
+        const changed = this.changed.signal
+        const active = signal ? AbortSignal.any([changed, signal]) : changed
+        const start = performance.now()
+        try {
+          await sleep(Math.ceil(remaining * 1000 / rate), active)
+          return
+        } catch (error) {
+          signal?.throwIfAborted()
+          if (!changed.aborted) throw error
+          remaining -= rate * (performance.now() - start) / 1000
+        }
       }
     })
     this.chain = run.catch(() => undefined)
-    return run
-  }
-}
-
-export async function moveSafe(src: string, dest: string): Promise<void> {
-  try {
-    await fs.rename(src, dest)
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code
-    if (code === 'EXDEV') {
-      await fs.copyFile(src, dest)
-      await fs.unlink(src)
-      return
-    }
-    throw err
+    if (!signal) return run
+    return new Promise((resolve, reject) => {
+      const abort = (): void => reject(signal.reason)
+      if (signal.aborted) return abort()
+      signal.addEventListener('abort', abort, { once: true })
+      void run.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort))
+    })
   }
 }
 

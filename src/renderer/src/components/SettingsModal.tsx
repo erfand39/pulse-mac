@@ -25,7 +25,7 @@ import { useApp } from '../state'
 import { dictionaries } from '../i18n'
 import { Modal } from './Modal'
 import { Logo, Toggle } from './primitives'
-import { cn } from '../lib/format'
+import { cleanIpcError, cn } from '../lib/format'
 
 type Tab = 'general' | 'speed' | 'appearance' | 'tools' | 'about'
 
@@ -37,27 +37,35 @@ export function SettingsModal(): React.JSX.Element {
     settings,
     stats,
     system,
-    patchSettings,
     pushToast,
-    refreshTools,
-    updateInfo,
-    updatePhase,
-    checkUpdates,
-    setUpdateOpen
+    refreshTools
   } = useApp()
+  const [startTab, setStartTab] = useState<Tab>('general')
   const [tab, setTab] = useState<Tab>('general')
   const [draft, setDraft] = useState<Partial<Settings>>({})
   const [installing, setInstalling] = useState(false)
+  const [tokenDraft, setTokenDraft] = useState<string | null>(null)
   const [customLimit, setCustomLimit] = useState('')
 
   useEffect(() => {
     if (!settingsOpen) return
     setDraft({})
-    setTab('general')
+    setTokenDraft(null)
+    setTab(startTab)
     setCustomLimit(
       settings.globalSpeedLimit ? String(+(settings.globalSpeedLimit / (1024 * 1024)).toFixed(2)) : ''
     )
-  }, [settingsOpen])
+  }, [settingsOpen, startTab])
+
+  useEffect(() => {
+    const navigate = (event: Event): void => {
+      const next = (event as CustomEvent).detail === 'about' ? 'about' : 'general'
+      setStartTab(next)
+      setTab(next)
+    }
+    window.addEventListener('pulse-settings', navigate)
+    return () => window.removeEventListener('pulse-settings', navigate)
+  }, [])
 
   const merged = useMemo<Settings>(() => ({ ...settings, ...draft }), [settings, draft])
 
@@ -65,10 +73,15 @@ export function SettingsModal(): React.JSX.Element {
     setDraft((prev) => ({ ...prev, [key]: value }))
   }
 
-  const save = (): void => {
-    patchSettings(draft)
-    pushToast('success', dictionaries[merged.language].toast.settingsSaved)
-    setSettingsOpen(false)
+  const save = async (): Promise<void> => {
+    try {
+      if (tokenDraft !== null) await window.pulse.setGithubToken(tokenDraft)
+      await window.pulse.updateSettings(draft)
+      pushToast('success', dictionaries[merged.language].toast.settingsSaved)
+      setSettingsOpen(false)
+    } catch (error) {
+      pushToast('error', cleanIpcError(error, t.settings.title))
+    }
   }
 
   const chooseDir = async (): Promise<void> => {
@@ -137,7 +150,7 @@ export function SettingsModal(): React.JSX.Element {
             </button>
           ))}
           <div className="mt-auto px-1 pb-1 text-[9px] leading-relaxed text-faint">
-            Pulse v{system?.appVersion ?? '1.0.0'} · {system?.platform === 'linux' ? 'Linux' : 'Windows'}
+            Pulse v{system?.appVersion ?? '1.0.0'} · macOS · {system?.arch}
           </div>
         </div>
 
@@ -174,7 +187,7 @@ export function SettingsModal(): React.JSX.Element {
                     <input
                       type="range"
                       min={1}
-                      max={32}
+                      max={16}
                       value={merged.connections}
                       onChange={(e) => set('connections', Number(e.target.value))}
                       aria-label={t.settings.general.connections}
@@ -185,6 +198,16 @@ export function SettingsModal(): React.JSX.Element {
                 </Group>
               </div>
 
+              <Group title={merged.language === 'fa' ? 'پراکسی دانلود مستقیم' : 'Direct download proxy'}>
+                <input
+                  aria-label={merged.language === 'fa' ? 'پراکسی دانلود مستقیم' : 'Direct download proxy'}
+                  value={merged.proxy}
+                  onChange={(event) => set('proxy', event.target.value.trim())}
+                  placeholder="direct · system · http:// · socks5://"
+                  className="field h-8 w-full px-2 text-[10px]"
+                  dir="ltr"
+                />
+              </Group>
               <div className="divide-y divide-line/60 overflow-hidden rounded-xl border border-line">
                 <ToggleRow
                   title={t.settings.general.autoResume}
@@ -202,6 +225,11 @@ export function SettingsModal(): React.JSX.Element {
                   checked={merged.launchAtStartup}
                   onChange={(v) => set('launchAtStartup', v)}
                   disabled={system ? !system.autoStartSupported : false}
+                />
+                <ToggleRow
+                  title={merged.language === 'fa' ? 'ادامهٔ دانلودها پس از بستن پنجره' : 'Keep downloading after closing the window'}
+                  checked={merged.keepRunningOnClose}
+                  onChange={(v) => set('keepRunningOnClose', v)}
                 />
                 <ToggleRow
                   title={t.settings.general.notify}
@@ -308,6 +336,13 @@ export function SettingsModal(): React.JSX.Element {
                     icon={<Sun size={16} />}
                     preview={{ bg: '#ffffff', bar: 'rgba(15,23,42,0.14)', accent: '#2f5fd0' }}
                     onClick={() => set('theme', 'light')}
+                  />
+                  <ThemeCard
+                    active={merged.theme === 'system'}
+                    label={merged.language === 'fa' ? 'سیستم' : 'System'}
+                    icon={<Monitor size={16} />}
+                    preview={{ bg: '#20242d', bar: '#cbd5e1', accent: '#4a7df0' }}
+                    onClick={() => set('theme', 'system')}
                   />
                 </div>
               </Group>
@@ -426,6 +461,16 @@ export function SettingsModal(): React.JSX.Element {
                   )
                 }
               />
+              <div className="flex flex-wrap gap-2">
+                {(['ytDlpPath', 'ffmpegPath'] as const).map((tool) => (
+                  <button key={tool} type="button" className="btn btn-soft" onClick={async () => {
+                    const path = await window.pulse.chooseTool(tool)
+                    if (path) set(tool, path)
+                  }}>
+                    {merged.language === 'fa' ? 'انتخاب' : 'Choose'} {tool === 'ffmpegPath' ? 'FFmpeg' : 'yt-dlp'}
+                  </button>
+                ))}
+              </div>
               <ToolCard
                 title={t.settings.tools.torrent}
                 desc={t.settings.tools.torrentDesc}
@@ -479,6 +524,7 @@ export function SettingsModal(): React.JSX.Element {
                       <option value="opera">Opera</option>
                       <option value="vivaldi">Vivaldi</option>
                       <option value="chromium">Chromium</option>
+                      <option value="safari">Safari</option>
                     </select>
                   </label>
                   <label className="block">
@@ -514,7 +560,7 @@ export function SettingsModal(): React.JSX.Element {
                     type="button"
                     onClick={() =>
                       void window.pulse.openExternal(
-                        'https://github.com/settings/tokens/new?scopes=public_repo&description=Pulse'
+                        'https://github.com/settings/tokens/new?description=Pulse-Mac'
                       )
                     }
                     className="ms-auto flex items-center gap-1 text-[9px] text-brand transition hover:underline"
@@ -528,8 +574,8 @@ export function SettingsModal(): React.JSX.Element {
                 </p>
                 <input
                   type="password"
-                  value={merged.githubToken}
-                  onChange={(e) => set('githubToken', e.target.value)}
+                  value={tokenDraft ?? ''}
+                  onChange={(e) => setTokenDraft(e.target.value)}
                   placeholder={t.settings.tools.githubTokenPlaceholder}
                   aria-label={t.settings.tools.githubToken}
                   className="field mt-2 h-8 w-full px-2 text-[10px]"
@@ -537,6 +583,11 @@ export function SettingsModal(): React.JSX.Element {
                   autoComplete="off"
                   spellCheck={false}
                 />
+                {settings.githubTokenConfigured && (
+                  <button type="button" className="btn btn-soft mt-2" onClick={() => setTokenDraft('')}>
+                    {tokenDraft === '' ? (merged.language === 'fa' ? 'پس از ذخیره حذف می‌شود' : 'Will be removed on save') : (merged.language === 'fa' ? 'حذف توکن' : 'Remove token')}
+                  </button>
+                )}
               </div>
               <div className="flex items-center justify-between rounded-xl border border-line bg-elev/25 px-3 py-2.5">
                 <div className="flex items-center gap-2 text-[10.5px] text-muted">
@@ -558,7 +609,7 @@ export function SettingsModal(): React.JSX.Element {
           {tab === 'about' ? (
             <div className="flex flex-col items-center py-6 text-center">
               <Logo size={64} glow={false} />
-              <h3 className="mt-4 text-[19px] font-semibold tracking-tight">Pulse Download Manager</h3>
+              <h3 className="mt-4 text-[19px] font-semibold tracking-tight">Pulse Mac</h3>
               <p className="mt-1 max-w-sm text-[11px] leading-relaxed text-muted">{t.settings.about.built}</p>
               <div className="mt-3 flex flex-wrap justify-center gap-1.5">
                 <span className="chip"><Activity size={10} /> HTTP ×{merged.connections}</span>
@@ -569,7 +620,7 @@ export function SettingsModal(): React.JSX.Element {
               <p className="mt-3 max-w-md text-[10px] leading-relaxed text-faint">{t.settings.about.features}</p>
               <div className="mt-5 w-full max-w-sm divide-y divide-line/60 overflow-hidden rounded-xl border border-line text-start">
                 <Row label={t.settings.about.version} value={system?.appVersion ?? '1.0.0'} />
-                <Row label={t.settings.about.platform} value={`${system?.platform} ${system?.version}`} />
+                <Row label={t.settings.about.platform} value={`macOS ${system?.version ?? ''} · ${system?.arch ?? ''}`} />
                 <Row label={t.settings.about.electron} value={`Electron ${system?.runtime?.electron ?? ''}`} />
                 <LinkRow
                   label={t.settings.about.repository}
@@ -587,39 +638,7 @@ export function SettingsModal(): React.JSX.Element {
                     )
                   }
                 />
-                <div className="flex items-center justify-between gap-3 px-3 py-2">
-                  <div className="min-w-0">
-                    <div className="text-[9.5px] text-faint">{t.settings.about.updates}</div>
-                    <div
-                      className={cn(
-                        'mt-0.5 truncate text-[9.5px] font-medium',
-                        updateInfo?.hasUpdate ? 'text-brand' : 'text-muted'
-                      )}
-                    >
-                      {updatePhase === 'checking'
-                        ? t.settings.about.checking
-                        : updateInfo?.hasUpdate
-                          ? t.update.available.replace('{version}', updateInfo.latest)
-                          : updateInfo
-                            ? t.settings.about.upToDate
-                            : system
-                              ? `v${system.appVersion}`
-                              : ''}
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (updateInfo?.hasUpdate) setUpdateOpen(true)
-                      else void checkUpdates()
-                    }}
-                    disabled={updatePhase === 'checking'}
-                    className="btn btn-ghost h-7 shrink-0 px-2.5 text-[9.5px]"
-                  >
-                    <RefreshCw size={11} className={cn(updatePhase === 'checking' && 'animate-spin')} />
-                    {updateInfo?.hasUpdate ? t.toast.viewUpdate : t.settings.about.checkUpdates}
-                  </button>
-                </div>
+
               </div>
             </div>
           ) : null}

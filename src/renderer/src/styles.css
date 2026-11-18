@@ -2,9 +2,9 @@
 
 @theme {
   --font-sans:
-    'Segoe UI Variable Text', 'Segoe UI', system-ui,
+    -apple-system, BlinkMacSystemFont, system-ui,
     'Noto Sans JP', 'Noto Sans KR', 'Noto Sans SC', 'Noto Sans TC',
-    'Noto Sans', 'Vazirmatn', 'Tahoma', 'Noto Sans Arabic',
+    'Noto Sans', 'Geeza Pro', 'Noto Sans Arabic',
     sans-serif;
   --color-app: var(--c-app);
   --color-panel: var(--c-panel);

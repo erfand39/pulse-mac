@@ -1,10 +1,25 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync, promises as fs } from 'node:fs'
-import { isAbsolute, join, resolve as resolvePath } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { app } from 'electron'
 import type { Settings, YoutubeFormatOption, YoutubeProbe, YoutubeMeta } from '@shared/types'
 import type { EngineHost, TaskHandle } from './http'
 import { ensureDir, sanitizeFileName } from '../util'
+import { atomicWrite } from '../durable-file'
+import { installMacYtDlp, macYtDlpRelease } from './ytdlp-release'
+import { httpUrl } from '../validate'
+
+const shutdown = new AbortController()
+const utilityRuns = new Set<Promise<unknown>>()
+const toolEnvironment: NodeJS.ProcessEnv = {
+  ...process.env,
+  PATH: [process.env.PATH, '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'].filter(Boolean).join(':'),
+  PYTHONIOENCODING: 'utf-8',
+  PULSE_NODE_EXECUTABLE: process.execPath
+}
+delete toolEnvironment.ELECTRON_RUN_AS_NODE
+delete toolEnvironment.NODE_OPTIONS
+delete toolEnvironment.NODE_EXTRA_CA_CERTS
 
 export interface BinInfo {
   cmd: string
@@ -40,7 +55,7 @@ function friendlyYoutubeError(raw: string): string {
   if (/age[- ]restricted|confirm your age/i.test(text)) {
     return 'This video is age-restricted. Add cookies from a signed-in account in Settings → Tools.'
   }
-  return text
+  return ''
 }
 
 function runCapture(
@@ -48,60 +63,43 @@ function runCapture(
   args: string[],
   timeout = 15_000
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
-  return new Promise((resolve) => {
+  const active = AbortSignal.any([shutdown.signal, AbortSignal.timeout(timeout)])
+  const result = new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+    if (active.aborted) return resolve({ code: -1, stdout: '', stderr: '' })
     let stdout = ''
     let stderr = ''
-    let child: ChildProcess
-    try {
-      child = spawn(cmd, args, { windowsHide: true })
-    } catch {
-      resolve({ code: -1, stdout: '', stderr: 'spawn failed' })
-      return
-    }
-    const timer = setTimeout(() => {
-      try {
-        child.kill()
-      } catch {
-        /* ignore */
-      }
-    }, timeout)
-    child.stdout?.on('data', (d) => {
-      stdout += d.toString()
-      if (stdout.length > 8_000_000) stdout = stdout.slice(-1_000_000)
+    const child = spawn(cmd, args, { detached: true, env: toolEnvironment, stdio: ['ignore', 'pipe', 'pipe'] })
+    const abort = (): void => killTree(child, 'SIGKILL')
+    active.addEventListener('abort', abort, { once: true })
+    child.stdout.on('data', (data: Buffer) => {
+      stdout += data.toString()
+      if (stdout.length > 8_000_000) abort()
     })
-    child.stderr?.on('data', (d) => {
-      stderr += d.toString()
+    child.stderr.on('data', (data: Buffer) => {
+      stderr = (stderr + data.toString()).slice(-30_000)
     })
-    child.on('error', (err) => {
-      clearTimeout(timer)
-      resolve({ code: -1, stdout, stderr: stderr + err.message })
-    })
+    child.on('error', () => { /* close follows error */ })
     child.on('close', (code) => {
-      clearTimeout(timer)
+      active.removeEventListener('abort', abort)
       resolve({ code, stdout, stderr })
     })
   })
+  utilityRuns.add(result)
+  void result.finally(() => utilityRuns.delete(result))
+  return result
 }
 
-function killTree(child: ChildProcess): void {
+function killTree(child: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): void {
   if (!child.pid) return
-  if (process.platform === 'win32') {
-    try {
-      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true })
-    } catch {
-      child.kill()
-    }
-  } else {
-    try {
-      process.kill(-child.pid, 'SIGTERM')
-    } catch {
-      child.kill('SIGTERM')
-    }
+  try {
+    process.kill(-child.pid, signal)
+  } catch {
+    child.kill(signal)
   }
 }
 
 export function bundledBin(name: string): string {
-  const exe = process.platform === 'win32' ? `${name}.exe` : name
+  const exe = name
   const candidates = [
     join(process.resourcesPath || '', 'bin', exe),
     join(app.getAppPath(), 'resources', 'bin', exe),
@@ -116,6 +114,7 @@ export class YoutubeEngine {
   private binCache: BinInfo | null = null
   private childs = new Map<string, ChildProcess>()
   private ffmpegCache: string | null | undefined = undefined
+  private installation?: Promise<{ ok: boolean; message: string }>
   private jsRuntimeCache: string | null | undefined = undefined
   versionCache = ''
 
@@ -134,14 +133,6 @@ export class YoutubeEngine {
     const bundled = bundledBin('yt-dlp')
     if (bundled) candidates.push({ cmd: bundled, prefix: [] })
     candidates.push({ cmd: 'yt-dlp', prefix: [] })
-    if (process.platform === 'win32') {
-      candidates.push({
-        cmd: join(process.env.LOCALAPPDATA || '', 'Programs', 'Python', 'Python313', 'Scripts', 'yt-dlp.exe'),
-        prefix: []
-      })
-    }
-    candidates.push({ cmd: 'python', prefix: ['-m', 'yt_dlp'] })
-    candidates.push({ cmd: 'python3', prefix: ['-m', 'yt_dlp'] })
 
     for (const candidate of candidates) {
       if (candidate.cmd.includes('\\') || candidate.cmd.includes('/')) {
@@ -165,7 +156,7 @@ export class YoutubeEngine {
     const candidates = [
       settings.ffmpegPath,
       bundledBin('ffmpeg'),
-      process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg'
+      'ffmpeg'
     ].filter(Boolean)
 
     const locate = async (cmd: string): Promise<string | null> => {
@@ -174,8 +165,7 @@ export class YoutubeEngine {
       }
       // `where`/`which` gives yt-dlp the absolute path it needs for
       // --ffmpeg-location (a bare "ffmpeg.exe" would be resolved against CWD).
-      const finder = process.platform === 'win32' ? 'where.exe' : 'which'
-      const found = await runCapture(finder, [cmd], 6_000)
+      const found = await runCapture('/usr/bin/which', [cmd], 6_000)
       if (found.code !== 0) return null
       return (
         found.stdout
@@ -189,7 +179,8 @@ export class YoutubeEngine {
       const path = await locate(candidate)
       if (!path) continue
       const res = await runCapture(path, ['-version'], 10_000)
-      if (res.code === 0 && /ffmpeg version/i.test(res.stdout + res.stderr)) {
+      const probe = await runCapture(join(dirname(path), 'ffprobe'), ['-version'], 10_000)
+      if (res.code === 0 && probe.code === 0 && /ffmpeg version/i.test(res.stdout + res.stderr)) {
         this.ffmpegCache = path
         return path
       }
@@ -205,12 +196,26 @@ export class YoutubeEngine {
    */
   private async resolveJsRuntime(): Promise<string | null> {
     if (this.jsRuntimeCache !== undefined) return this.jsRuntimeCache
-    const candidates = process.platform === 'win32' ? ['node.exe', 'node'] : ['node']
-    for (const cmd of candidates) {
-      const res = await runCapture(cmd, ['--version'], 6_000)
-      if (res.code === 0 && /^v\d+\.\d+/m.test(res.stdout.trim())) {
-        this.jsRuntimeCache = cmd
-        return cmd
+    for (const runtime of ['deno', 'node']) {
+      const chosen = await runCapture('/usr/bin/which', [runtime], 6_000)
+      const path = chosen.stdout.trim()
+      if (!isAbsolute(path)) continue
+      const res = await runCapture(path, ['--version'], 6_000)
+      if (res.code === 0) {
+        this.jsRuntimeCache = `${runtime}:${path}`
+        return this.jsRuntimeCache
+      }
+    }
+    if (process.platform === 'darwin' && process.versions.electron) {
+      const dir = join(app.getPath('userData'), 'bin')
+      await fs.mkdir(dir, { recursive: true, mode: 0o700 })
+      const shim = join(dir, 'pulse-node')
+      await atomicWrite(shim, '#!/bin/sh\nELECTRON_RUN_AS_NODE=1 exec "$PULSE_NODE_EXECUTABLE" "$@"\n')
+      await fs.chmod(shim, 0o700)
+      const version = await runCapture(shim, ['--version'], 6_000)
+      if (version.code === 0 && /^v\d+/.test(version.stdout)) {
+        this.jsRuntimeCache = `node:${shim}`
+        return this.jsRuntimeCache
       }
     }
     this.jsRuntimeCache = null
@@ -227,7 +232,8 @@ export class YoutubeEngine {
 
   private async jsRuntimeArgs(): Promise<string[]> {
     if (!this.supportsJsRuntime()) return []
-    return (await this.resolveJsRuntime()) ? ['--js-runtimes', 'node'] : []
+    const runtime = await this.resolveJsRuntime()
+    return runtime ? ['--js-runtimes', runtime] : []
   }
 
   private cookieArgs(): string[] {
@@ -262,12 +268,14 @@ export class YoutubeEngine {
   }> {
     this.binCache = null
     this.ffmpegCache = undefined
+    this.jsRuntimeCache = undefined
     const status = await this.status()
     this.versionCache = status.ytdlp.version || ''
     return status
   }
 
   async probe(url: string): Promise<YoutubeProbe> {
+    httpUrl.parse(url)
     const bin = await this.resolveBin()
     if (!bin) {
       throw new Error(
@@ -276,7 +284,7 @@ export class YoutubeEngine {
     }
     const args = [
       ...bin.prefix,
-      '-J',
+      '--ignore-config', '-J',
       '--no-warnings',
       '--no-colors',
       '--flat-playlist',
@@ -288,7 +296,7 @@ export class YoutubeEngine {
       '3',
       ...this.cookieArgs(),
       ...(await this.jsRuntimeArgs()),
-      url
+      '--', url
     ]
     const res = await runCapture(bin.cmd, args, 90_000)
     if (res.code !== 0 || !res.stdout.trim()) {
@@ -483,13 +491,24 @@ export class YoutubeEngine {
       selector = 'best[ext=mp4]/best'
       handle.toast('info', 'ffmpeg is missing. Downloading the best single-file format instead.')
     }
-    const outputTemplate = join(task.dir, '%(title).120B [%(id)s].%(ext)s')
+    const dir = join(task.dir, `${sanitizeFileName(task.name).slice(0, 45)} [${task.id}]`)
+    await ensureDir(dir)
+    if (await fs.realpath(dir) !== dir || !(await fs.lstat(dir)).isDirectory()) {
+      throw new Error('The video folder moved or is not a regular directory.')
+    }
+    const entries = await fs.readdir(dir, { withFileTypes: true })
+    if (entries.some((entry) => !entry.isFile())) throw new Error('The video folder contains unsupported files.')
+    const outputTemplate = join(dir, '%(title).120B [%(id)s].%(ext)s')
     const args = [
       ...bin.prefix,
       '--no-warnings',
       '--no-colors',
       '--newline',
+      '--ignore-config',
       '--no-playlist',
+      '--no-overwrites',
+      '--print', 'after_move:PULSE_FILE|%(filepath)j',
+      '--progress',
       '--continue',
       '--no-mtime',
       '--retries',
@@ -509,7 +528,6 @@ export class YoutubeEngine {
       ...this.cookieArgs()
     ]
     args.push(...(await this.jsRuntimeArgs()))
-    if (process.platform === 'win32') args.push('--windows-filenames')
     if (ffmpeg) args.push('--ffmpeg-location', ffmpeg)
     if (settings.globalSpeedLimit > 0) {
       args.push('--limit-rate', `${Math.round(settings.globalSpeedLimit / 1024)}K`)
@@ -524,28 +542,37 @@ export class YoutubeEngine {
     if (opts.thumbnail && ffmpeg) {
       args.push('--write-thumbnail', '--convert-thumbnails', 'jpg', '--embed-thumbnail')
     }
-    args.push('--', task.url)
+    args.push('--', httpUrl.parse(task.url))
+    if (handle.signal.aborted) return
 
     const meta: YoutubeMeta = { ...(task.youtube || { title: task.name }), title: task.name }
     handle.patch({ status: 'downloading', error: undefined, connections: 1, youtube: meta })
 
     await new Promise<void>((resolve) => {
-      const startedAt = Date.now()
       const child = spawn(bin.cmd, args, {
-        windowsHide: true,
-        env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
+        detached: true,
+        env: toolEnvironment
       })
       this.childs.set(task.id, child)
       let stdout = ''
       let stderr = ''
       let lastEmit = 0
       let lastSize = 0
+      let finalPath = ''
+      let killTimer: ReturnType<typeof setTimeout> | undefined
+      const abort = (): void => {
+        killTree(child)
+        killTimer ??= setTimeout(() => killTree(child, 'SIGKILL'), 2500)
+      }
+      handle.signal.addEventListener('abort', abort, { once: true })
 
       let finished = false
       const finish = (fn: () => void): void => {
         if (finished) return
         finished = true
         this.childs.delete(task.id)
+        clearTimeout(killTimer)
+        handle.signal.removeEventListener('abort', abort)
         fn()
         resolve()
       }
@@ -571,34 +598,29 @@ export class YoutubeEngine {
           }
           return
         }
-        if (line.startsWith('[download] Destination:')) {
-          const p = line.replace('[download] Destination:', '').trim()
-          if (p) handle.patch({ filePath: p, fileName: p.split(/[\\/]/).pop() })
-          return
-        }
-        if (line.startsWith('[Merger] Merging formats into')) {
-          const m = /"(.*)"/.exec(line)
-          if (m) {
-            handle.patch({ filePath: m[1], fileName: m[1].split(/[\\/]/).pop() })
-          }
+        if (line.startsWith('PULSE_FILE|')) {
+          try {
+            const result: unknown = JSON.parse(line.slice(11))
+            if (typeof result === 'string') finalPath = result
+          } catch { /* the final file will be validated on exit */ }
         }
       }
 
       child.stdout?.on('data', (chunk: Buffer) => {
         stdout += chunk.toString('utf8')
         const lines = stdout.split(/\r?\n/)
-        stdout = lines.pop() || ''
+        stdout = (lines.pop() || '').slice(-8192)
         for (const line of lines) handleLine(line.trim())
       })
       child.stderr?.on('data', (chunk: Buffer) => {
         stderr += chunk.toString('utf8')
         if (stderr.length > 200_000) stderr = stderr.slice(-60_000)
       })
-      child.on('error', (err) => {
+      child.on('error', () => {
         finish(() => {
           handle.patch({
             status: 'error',
-            error: `Could not start yt-dlp: ${err.message}`,
+            error: 'Could not start yt-dlp.',
             speed: 0,
             eta: 0,
             connections: 0
@@ -613,27 +635,22 @@ export class YoutubeEngine {
           return
         }
         if (code === 0) {
-          const found = await this.findOutput(task.dir, task.youtube?.videoId || '', startedAt)
-          let finalSize = lastSize
-          if (found) {
-            try {
-              finalSize = (await fs.stat(found)).size
-            } catch {
-              /* keep the downloaded byte count */
-            }
-          }
+          const file = finalPath && dirname(finalPath) === dir
+            ? await fs.lstat(finalPath).catch(() => null)
+            : null
+          const valid = file && file.isFile() && file.size > 0
           finish(() => {
-            handle.patch({
-              status: 'completed',
-              downloaded: finalSize,
-              size: finalSize,
-              completedAt: Date.now(),
-              speed: 0,
-              eta: 0,
-              connections: 0,
-              filePath: found || task.filePath,
-              fileName: found ? found.split(/[\\/]/).pop() : task.fileName
-            })
+            if (handle.signal.aborted) {
+              handle.patch({ status: 'paused', speed: 0, eta: 0, connections: 0 })
+            } else if (valid && file) {
+              handle.patch({
+                status: 'completed', downloaded: file.size, size: file.size,
+                completedAt: Date.now(), speed: 0, eta: 0, connections: 0,
+                filePath: finalPath, fileName: basename(finalPath)
+              })
+            } else {
+              handle.patch({ status: 'error', error: 'yt-dlp did not report a valid final file.', speed: 0, eta: 0, connections: 0 })
+            }
           })
           return
         }
@@ -653,69 +670,35 @@ export class YoutubeEngine {
           })
         })
       })
-      handle.signal.addEventListener(
-        'abort',
-        () => {
-          killTree(child)
-          setTimeout(() => {
-            finish(() => handle.patch({ status: 'paused', speed: 0, eta: 0, connections: 0 }))
-          }, 400)
-        },
-        { once: true }
-      )
     })
   }
 
-  private async findOutput(dir: string, videoId: string, since = 0): Promise<string | null> {
+  install(): Promise<{ ok: boolean; message: string }> {
+    if (this.installation) return this.installation
+    const task = this.installPinnedBinary().finally(() => { this.installation = undefined })
+    this.installation = task
+    return task
+  }
+
+  private async installPinnedBinary(): Promise<{ ok: boolean; message: string }> {
+    if (process.platform !== 'darwin' || process.arch !== 'arm64') {
+      return { ok: false, message: 'yt-dlp installation requires an Apple Silicon Mac.' }
+    }
     try {
-      const entries = await fs.readdir(dir)
-      const candidates = entries
-        .filter((e) => (videoId ? e.includes(videoId) : true))
-        .filter((e) => !e.endsWith('.part') && !e.endsWith('.ytdl') && !e.endsWith('.pulse-part'))
-        .filter((e) => !/\.(jpg|webp|png|vtt|srt|ass)$/i.test(e))
-      if (!candidates.length) return null
-      const stats = await Promise.all(
-        candidates.map(async (c) => ({ c, st: await fs.stat(join(dir, c)).catch(() => null) }))
-      )
-      const files = stats.filter((s) => s.st && s.st.isFile()) as Array<{
-        c: string
-        st: Awaited<ReturnType<typeof fs.stat>>
-      }>
-      if (!files.length) return null
-      // Prefer files touched by this run; fall back to the biggest match.
-      const fresh = since ? files.filter((f) => Number(f.st.mtimeMs) >= since - 60_000) : files
-      const pool = fresh.length ? fresh : files
-      pool.sort((a, b) => Number(b.st.size) - Number(a.st.size))
-      return join(dir, pool[0].c)
-    } catch {
-      return null
+      await installMacYtDlp(join(app.getPath('userData'), 'bin'), shutdown.signal, async (path) => {
+        const result = await runCapture(path, ['--version'])
+        return result.code === 0 && result.stdout.trim() === macYtDlpRelease.version
+      })
+      this.binCache = null
+      return { ok: true, message: `yt-dlp ${macYtDlpRelease.version} installed.` }
+    } catch (error) {
+      return { ok: false, message: (error as Error).message }
     }
   }
 
-  async install(): Promise<{ ok: boolean; message: string }> {
-    const dir = join(app.getPath('userData'), 'bin')
-    await fs.mkdir(dir, { recursive: true })
-    const exe = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp'
-    const target = join(dir, exe)
-    const url = `https://github.com/yt-dlp/yt-dlp/releases/latest/download/${exe}`
-    try {
-      const res = await fetch(url, { redirect: 'follow' })
-      if (!res.ok) return { ok: false, message: `Download failed: HTTP ${res.status}` }
-      const buf = Buffer.from(await res.arrayBuffer())
-      if (buf.length < 1_000_000) {
-        return { ok: false, message: 'Downloaded file looks corrupted. Try again later.' }
-      }
-      await fs.writeFile(target, buf)
-      if (process.platform !== 'win32') await fs.chmod(target, 0o755)
-      this.binCache = null
-      const bin = await this.resolveBin(true)
-      return {
-        ok: !!bin,
-        message: bin ? `yt-dlp ${bin.version} installed` : 'Installed, but the binary could not run.'
-      }
-    } catch (err) {
-      return { ok: false, message: (err as Error).message }
-    }
+  async shutdown(): Promise<void> {
+    shutdown.abort()
+    await Promise.allSettled([...utilityRuns, this.installation])
   }
 
   sanitize(name: string): string {

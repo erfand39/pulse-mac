@@ -1,26 +1,19 @@
-import { promises as fs, existsSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { constants, createReadStream, promises as fs, type Stats } from 'node:fs'
 import type { FileHandle } from 'node:fs/promises'
-import { join } from 'node:path'
-import type { DownloadTask, Settings, SegmentState } from '@shared/types'
-import {
-  GlobalThrottle,
-  ensureDir,
-  extFromMime,
-  fileSize,
-  guessNameFromUrl,
-  moveSafe,
-  parseContentDisposition,
-  safeJsonParse,
-  sanitizeFileName,
-  sleep,
-  uniquePath
-} from '../util'
+import { basename, extname, join } from 'node:path'
+import { z } from 'zod'
+import type { DownloadTask, SegmentState, Settings } from '@shared/types'
+import { atomicWrite, readLocalFile, sameFile, syncDirectory } from '../durable-file'
+import { ensureDir, extFromMime, guessNameFromUrl, parseContentDisposition, sanitizeFileName, sleep, type GlobalThrottle } from '../util'
+import { HttpNetwork } from './http-network'
 
 export interface EngineHost {
   settings(): Settings
   patch(task: DownloadTask, patch: Partial<DownloadTask>): void
   toast(level: 'info' | 'success' | 'error', message: string): void
   throttle: GlobalThrottle
+  resolveProxy?(url: string): Promise<string | undefined>
 }
 
 export interface TaskHandle {
@@ -42,581 +35,508 @@ export interface ProbeOutput {
   headers: Record<string, string>
 }
 
-interface HttpMeta {
-  version: 1
-  finalUrl: string
-  size: number
-  etag?: string
-  lastModified?: string
-  resumable: boolean
-  segments: SegmentState[]
-  downloaded: number
-  savedAt: number
+const position = z.number().int().nonnegative()
+const leaf = z.string().min(1).refine((value) => value !== '.' && value !== '..' && !/[/\\\0]/.test(value))
+const identityShape = z.object({ dev: position, ino: position })
+const checkpointShape = z.object({
+  source: z.string().regex(/^[a-f0-9]{64}$/),
+  validator: z.string().optional(),
+  destination: z.string().optional(),
+  modified: z.string().optional(),
+  size: position,
+  part: z.uuid(),
+  identity: identityShape,
+  segments: z.array(z.object({ start: position, end: position, position })).max(16),
+  publication: z.object({ name: leaf, size: position }).optional()
+})
+type Checkpoint = z.infer<typeof checkpointShape>
+
+class HttpError extends Error {
+  constructor(readonly status: number) { super(`HTTP ${status}`) }
 }
 
-const META_SUFFIX = '.pulse-meta'
-const PART_SUFFIX = '.pulse-part'
-const MAX_RETRIES = 5
-const EXPIRED_STATUSES = [401, 403, 404, 410]
-const LINK_EXPIRED_PREFIX = 'LINK_EXPIRED:'
+class RangeRejected extends Error {
+  constructor() { super('Server returned an invalid range or changed the file.') }
+}
 
-function parseTotalFromHeaders(res: Response): number {
-  const cr = res.headers.get('content-range')
-  if (cr) {
-    const total = cr.split('/')[1]
-    if (total && total !== '*') {
-      const n = Number(total)
-      if (Number.isFinite(n) && n > 0) return n
-    }
+const linkExpired = (error: unknown): boolean =>
+  error instanceof HttpError && [401, 403, 404, 410].includes(error.status)
+const digest = (value: string): string => createHash('sha256').update(value).digest('hex')
+const code = (error: unknown): string | undefined => (error as NodeJS.ErrnoException).code
+const exists = async (path: string): Promise<Stats | undefined> =>
+  fs.lstat(path).catch((error) => { if (code(error) !== 'ENOENT') throw error; return undefined })
+
+function identity(response: Response): boolean {
+  const encoding = response.headers.get('content-encoding')
+  return !encoding || encoding.toLowerCase() === 'identity'
+}
+
+function contentLength(response: Response): number | undefined {
+  const raw = response.headers.get('content-length')
+  if (raw === null) return
+  const size = Number(raw)
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(size)) throw new Error('Invalid Content-Length.')
+  return size
+}
+
+function contentRange(response: Response): { start: number; end: number; size: number } | undefined {
+  const match = /^bytes (\d+)-(\d+)\/(\d+)$/i.exec(response.headers.get('content-range') ?? '')
+  if (!match) return
+  const [start, end, size] = match.slice(1).map(Number)
+  if ([start, end, size].every(Number.isSafeInteger) && start <= end && end < size) {
+    return { start, end, size }
   }
-  const len = Number(res.headers.get('content-length') || 0)
-  return Number.isFinite(len) && len > 0 ? len : 0
+}
+
+function strongEtag(value: string | null): string | undefined {
+  return value && /^"[^"\r\n]*"$/.test(value) ? value : undefined
+}
+
+function buildSegments(size: number, connections: number): SegmentState[] {
+  const count = Math.max(1, Math.min(connections, Math.ceil(size / 1_048_576)))
+  const chunk = Math.floor(size / count)
+  return Array.from({ length: count }, (_, i) => ({
+    start: i * chunk, end: i === count - 1 ? size : (i + 1) * chunk, position: i * chunk
+  }))
+}
+
+function validSegments(segments: SegmentState[], size: number): boolean {
+  let offset = 0
+  if (!segments.length) return false
+  for (const segment of segments) {
+    if (segment.start !== offset || segment.position < offset ||
+        segment.end <= offset || segment.position > segment.end) return false
+    offset = segment.end
+  }
+  return size === offset
+}
+
+async function writeAll(file: FileHandle, value: Uint8Array, offset: number): Promise<void> {
+  let written = 0
+  while (written < value.length) {
+    const { bytesWritten } = await file.write(value, written, value.length - written, offset + written)
+    if (!bytesWritten) throw new Error('The disk could not finish the write.')
+    written += bytesWritten
+  }
+}
+
+function fileFor(checkpoint: Checkpoint, dir: string): string {
+  return join(dir, `${checkpoint.part}.part`)
+}
+
+function ownedFile(stat: Stats | undefined, checkpoint: Checkpoint): stat is Stats {
+  return !!stat?.isFile() && stat.dev === checkpoint.identity.dev && stat.ino === checkpoint.identity.ino
 }
 
 export class HttpEngine {
-  private host: EngineHost
+  private network: HttpNetwork
 
-  constructor(host: EngineHost) {
-    this.host = host
+  constructor(private host: EngineHost) {
+    this.network = new HttpNetwork(host.resolveProxy?.bind(host))
   }
 
-  private baseHeaders(task: DownloadTask): Record<string, string> {
-    const settings = this.host.settings()
-    const headers: Record<string, string> = {
-      'User-Agent': settings.userAgent,
+  private headers(url: string, custom?: Record<string, string>, userAgent?: string): Headers {
+    const headers = new Headers({
+      'User-Agent': userAgent || this.host.settings().userAgent || 'PulseMac',
       Accept: '*/*',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'identity'
+      'Accept-Encoding': 'identity',
+      Referer: `${new URL(url).origin}/`
+    })
+    for (const [name, value] of Object.entries(custom ?? {})) {
+      if (/^(accept|accept-language|referer|user-agent)$/i.test(name)) headers.set(name, value)
     }
-    try {
-      const origin = new URL(task.url).origin
-      if (origin && origin !== 'null') headers.Referer = `${origin}/`
-    } catch {
-      /* ignore */
-    }
-    return { ...headers, ...(task.headers || {}) }
+    return headers
   }
 
-  async probe(
-    url: string,
-    headers: Record<string, string> = {},
-    userAgent?: string
-  ): Promise<ProbeOutput> {
-    const settings = this.host.settings()
+  async probe(url: string, headers?: Record<string, string>, userAgent?: string, signal?: AbortSignal): Promise<ProbeOutput> {
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 30_000)
+    const abort = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
+    const timeout = setTimeout(() => controller.abort(new Error('Server response timed out.')), 20_000)
+    const request = this.headers(url, headers, userAgent)
+    request.set('Range', 'bytes=0-0')
     try {
-      const res = await fetch(url, {
-        headers: {
-          'User-Agent': userAgent || settings.userAgent,
-          Accept: '*/*',
-          'Accept-Encoding': 'identity',
-          Range: 'bytes=0-0',
-          ...headers
-        },
-        signal: controller.signal,
-        redirect: 'follow'
-      })
-      if (!res.ok && res.status !== 416) {
-        throw new Error(`HTTP ${res.status} ${res.statusText}`)
-      }
-      const size = parseTotalFromHeaders(res)
-      const resumable = res.status === 206 || /bytes/i.test(res.headers.get('accept-ranges') || '')
-      const contentType = res.headers.get('content-type') || undefined
-      let fileName =
-        parseContentDisposition(res.headers.get('content-disposition')) ||
-        guessNameFromUrl(res.url || url)
-      if (!/\.[a-z0-9]{2,6}$/i.test(fileName)) {
-        const ext = extFromMime(contentType)
-        if (ext) fileName += ext
-      }
-      fileName = sanitizeFileName(fileName)
-      const outHeaders: Record<string, string> = {}
-      res.headers.forEach((value, key) => {
-        if (['content-length', 'content-type', 'content-disposition'].includes(key)) {
-          outHeaders[key] = value
-        }
-      })
-      try {
+      let res = await this.network.request(url, request, abort)
+      let range = contentRange(res)
+      if (res.status === 416 || (res.status === 206 &&
+        (!range || range.start !== 0 || range.end !== 0 || !identity(res) ||
+          (contentLength(res) !== undefined && contentLength(res) !== 1)))) {
         await res.body?.cancel()
-      } catch {
-        /* ignore */
+        request.delete('Range')
+        res = await this.network.request(url, request, abort)
+        range = undefined
       }
-      return {
-        url,
-        finalUrl: res.url || url,
-        fileName,
-        size,
-        resumable,
-        contentType,
-        etag: res.headers.get('etag') || undefined,
-        lastModified: res.headers.get('last-modified') || undefined,
-        headers: outHeaders
+      try {
+        if (res.status !== 200 && !(res.status === 206 && range)) throw new HttpError(res.status)
+        const size = range?.size ?? (identity(res) ? contentLength(res) ?? 0 : 0)
+        const contentType = res.headers.get('content-type') ?? undefined
+        const fileName = parseContentDisposition(res.headers.get('content-disposition')) || guessNameFromUrl(res.url || url)
+        return {
+          url, finalUrl: res.url || url,
+          fileName: sanitizeFileName(extname(fileName) ? fileName : fileName + (extFromMime(contentType) ?? '')),
+          size,
+          resumable: !!range,
+          etag: strongEtag(res.headers.get('etag')),
+          lastModified: res.headers.get('last-modified') ?? undefined,
+          contentType,
+          headers: Object.fromEntries([...res.headers].filter(([name]) =>
+            ['content-length', 'content-type', 'content-disposition'].includes(name)))
+        }
+      } finally {
+        await res.body?.cancel()
       }
     } finally {
       clearTimeout(timeout)
+      controller.abort()
     }
   }
 
-  /**
-   * Point an existing partial download at a fresh URL. The sidecar metadata is
-   * rewritten so the next resume continues from the saved byte offsets. When
-   * the new link serves a different file size the partial data is discarded and
-   * `restarted` is returned so the UI can tell the user.
-   */
-  async resumeWithUrl(
-    task: DownloadTask,
-    url: string
-  ): Promise<{ ok: boolean; restarted?: boolean; error?: string; size?: number }> {
-    let probe: ProbeOutput
-    try {
-      const probeHeaders = this.baseHeaders({ ...task, url })
-      probe = await this.probe(url, probeHeaders, this.host.settings().userAgent)
-    } catch (err) {
-      return { ok: false, error: `Could not reach the new link: ${(err as Error).message}` }
-    }
-
-    let restarted = false
-    let kept = false
-    const finalPath = task.filePath
-    if (finalPath) {
-      const metaPath = `${finalPath}${META_SUFFIX}`
-      const partPath = `${finalPath}${PART_SUFFIX}`
-      if (existsSync(metaPath) && existsSync(partPath)) {
-        const raw = await fs.readFile(metaPath, 'utf8').catch(() => '')
-        const meta = safeJsonParse<HttpMeta | null>(raw, null)
-        if (meta && meta.version === 1) {
-          const sizeChanged = meta.size > 0 && probe.size > 0 && meta.size !== probe.size
-          // A signed link that no longer honours Range requests cannot be
-          // resumed, so keeping the partial data would only stall the task.
-          const rangesLost = task.downloaded > 0 && probe.size > 0 && !probe.resumable
-          if (sizeChanged || rangesLost) {
-            await fs.unlink(partPath).catch(() => undefined)
-            await fs.unlink(metaPath).catch(() => undefined)
-            restarted = task.downloaded > 0
-          } else {
-            meta.finalUrl = probe.finalUrl
-            meta.etag = probe.etag
-            meta.lastModified = probe.lastModified
-            meta.resumable = probe.resumable
-            if (!probe.resumable && task.downloaded === 0) {
-              meta.segments = []
-              meta.downloaded = 0
-            }
-            meta.savedAt = Date.now()
-            await fs.writeFile(metaPath, JSON.stringify(meta), 'utf8').catch(() => undefined)
-            kept = true
-          }
-        }
-      }
-    }
-    if (!kept && !restarted) restarted = task.downloaded > 0
-    return { ok: true, restarted, size: probe.size }
-  }
-
-  async start(handle: TaskHandle, resume: boolean): Promise<void> {
-    const task = handle.task
-    const settings = this.host.settings()
-    await ensureDir(task.dir)
-
-    if (!task.fileName) task.fileName = guessNameFromUrl(task.url)
-    let fileName = sanitizeFileName(task.fileName)
-
-    let finalPath = task.filePath || join(task.dir, fileName)
-    let metaPath = `${finalPath}${META_SUFFIX}`
-    let partPath = `${finalPath}${PART_SUFFIX}`
-
-    // Keep the sidecar paths in sync whenever the final name is adjusted.
-    const setFinalPath = (next: string): void => {
-      finalPath = next
-      metaPath = `${next}${META_SUFFIX}`
-      partPath = `${next}${PART_SUFFIX}`
-    }
-
-    if (resume && existsSync(finalPath) && !existsSync(partPath)) {
-      // Nothing left to do. The file is already complete on disk.
-      const size = await fileSize(finalPath)
-      handle.patch({
-        status: 'completed',
-        downloaded: size,
-        size: size || task.size,
-        connections: 0,
-        speed: 0,
-        eta: 0,
-        completedAt: Date.now(),
-        filePath: finalPath,
-        fileName
-      })
-      return
-    }
-
-    let meta: HttpMeta | null = null
-    if (resume && existsSync(metaPath) && existsSync(partPath)) {
-      const raw = await fs.readFile(metaPath, 'utf8').catch(() => '')
-      const parsed = safeJsonParse<HttpMeta | null>(raw, null)
-      if (parsed && parsed.version === 1 && parsed.size > 0 && parsed.segments?.length) {
-        meta = parsed
-      }
-    }
-
-    if (!meta) {
-      if (!task.filePath) {
-        const target = await uniquePath(task.dir, fileName)
-        setFinalPath(target)
-        fileName = target.split(/[\\/]/).pop() as string
-      }
-      handle.patch({ status: 'connecting', filePath: finalPath, fileName, error: undefined })
-      let probe: ProbeOutput
-      try {
-        probe = await this.probe(task.url, task.headers, settings.userAgent)
-      } catch (err) {
-        const message = (err as Error).message
-        handle.patch({
-          status: 'error',
-          error: `Could not reach the server: ${message}`,
-          linkExpired: /^HTTP (401|403|404|410)\b/.test(message) || task.linkExpired,
-          connections: 0,
-          speed: 0,
-          eta: 0
-        })
-        return
-      }
-      if (handle.signal.aborted) return
-      if (!task.fileName || task.fileName === guessNameFromUrl(task.url)) {
-        const nice = sanitizeFileName(probe.fileName)
-        if (nice && nice !== fileName) {
-          const target = await uniquePath(task.dir, nice)
-          setFinalPath(target)
-          fileName = target.split(/[\\/]/).pop() as string
-        }
-      }
-      meta = {
-        version: 1,
-        finalUrl: probe.finalUrl,
-        size: probe.size,
-        etag: probe.etag,
-        lastModified: probe.lastModified,
-        resumable: probe.resumable,
-        segments: [],
-        downloaded: 0,
-        savedAt: Date.now()
-      }
-      handle.patch({
-        size: probe.size,
-        resumable: probe.resumable,
-        filePath: finalPath,
-        fileName
-      })
-    }
-
-    if (meta.size <= 0) {
-      await this.streamUnknownSize(handle, finalPath, meta.finalUrl)
-      return
-    }
-
-    const segments: SegmentState[] = meta.segments.length
-      ? meta.segments
-      : this.buildSegments(meta.size, meta.resumable ? task.maxConnections || settings.connections : 1)
-
-    const partExists = existsSync(partPath)
-    let handleFs: FileHandle
-    try {
-      handleFs = partExists ? await fs.open(partPath, 'r+') : await fs.open(partPath, 'w+')
-      if (!partExists && meta.size > 0) await handleFs.truncate(meta.size)
-      const stat = await handleFs.stat()
-      if (meta.size > 0 && stat.size < meta.size) await handleFs.truncate(meta.size)
-    } catch (err) {
-      handle.patch({
-        status: 'error',
-        error: `Cannot write file: ${(err as Error).message}`,
-        connections: 0,
-        speed: 0,
-        eta: 0
-      })
-      return
-    }
-
-    const state: HttpMeta = {
-      ...meta,
-      segments,
-      downloaded: segments.reduce((acc, s) => acc + Math.max(0, s.position - s.start), 0),
-      savedAt: Date.now()
-    }
-
-    let lastEmit = 0
-    let lastSave = 0
-
-    const activeConns = segments.filter((s) => s.position < s.end).length || 1
-    handle.patch({
-      status: 'downloading',
-      filePath: finalPath,
-      fileName,
-      size: state.size,
-      downloaded: state.downloaded,
-      connections: activeConns,
-      resumable: state.resumable,
-      segments: state.segments.map((s) => ({ ...s })),
-      error: undefined,
-      linkExpired: false
+  private async stage(task: DownloadTask, create: boolean): Promise<string> {
+    z.uuid().parse(task.id)
+    if (create) await ensureDir(task.dir)
+    const root = await fs.realpath(task.dir)
+    if (root !== task.dir) throw new Error('Download folder moved. Restore the original folder.')
+    const stage = join(root, `.pulse-mac-${task.id}`)
+    if (create) await fs.mkdir(stage, { mode: 0o700 }).catch((error) => {
+      if (code(error) !== 'EEXIST') throw error
     })
-
-    const recompute = (): void => {
-      state.downloaded = state.segments.reduce(
-        (acc, s) => acc + Math.max(0, s.position - s.start),
-        0
-      )
+    if (!(await fs.lstat(stage)).isDirectory() || await fs.realpath(stage) !== stage) {
+      throw new Error('The work folder is not a regular directory.')
     }
+    return stage
+  }
 
-    const persist = async (): Promise<void> => {
-      recompute()
-      state.savedAt = Date.now()
-      await fs.writeFile(metaPath, JSON.stringify(state), 'utf8').catch(() => undefined)
-    }
-
-    const tick = (): void => {
-      const now = Date.now()
-      if (now - lastEmit >= 160) {
-        lastEmit = now
-        recompute()
-        handle.patch({
-          downloaded: state.downloaded,
-          size: state.size,
-          segments: state.segments.map((s) => ({ ...s }))
-        })
-      }
-      if (now - lastSave > 2500) {
-        lastSave = now
-        void persist()
-      }
-    }
-
-    const downloadSegment = async (seg: SegmentState, index: number): Promise<void> => {
-      let attempt = 0
-      while (seg.position < seg.end) {
-        if (handle.signal.aborted) return
-        const controller = new AbortController()
-        const relay = (): void => controller.abort()
-        handle.signal.addEventListener('abort', relay, { once: true })
-        try {
-          const ranged = state.resumable || seg.position > 0 || state.segments.length > 1
-          const headers = { ...this.baseHeaders(task) }
-          if (ranged) headers.Range = `bytes=${seg.position}-${seg.end - 1}`
-
-          const res = await fetch(state.finalUrl, {
-            headers,
-            signal: controller.signal,
-            redirect: 'follow'
-          })
-          if (res.status === 416) throw new Error('RANGE_CHANGED')
-          if (!res.ok) {
-            if (EXPIRED_STATUSES.includes(res.status)) {
-              throw new Error(`${LINK_EXPIRED_PREFIX}${res.status}`)
-            }
-            throw new Error(`HTTP ${res.status} ${res.statusText}`)
-          }
-          if (res.status === 200 && seg.position > 0) throw new Error('RANGE_UNSUPPORTED')
-          if (!res.body) throw new Error('Empty response body')
-
-          const reader = res.body.getReader()
-          while (true) {
-            if (handle.signal.aborted) {
-              await reader.cancel().catch(() => undefined)
-              return
-            }
-            const { done, value } = await reader.read()
-            if (done) break
-            if (!value || !value.byteLength) continue
-            const remain = seg.end - seg.position
-            if (remain <= 0) break
-            const len = Math.min(value.byteLength, remain)
-            const buf = Buffer.from(value.buffer, value.byteOffset, len)
-            await handleFs.write(buf, 0, len, seg.position)
-            seg.position += len
-            await this.host.throttle.consume(len, handle.signal)
-            tick()
-            if (len < value.byteLength) break
-          }
-          attempt = 0
-        } catch (err) {
-          if (handle.signal.aborted) return
-          const message = (err as Error).message || 'network error'
-          if (
-            message === 'RANGE_CHANGED' ||
-            message === 'RANGE_UNSUPPORTED' ||
-            message.startsWith(LINK_EXPIRED_PREFIX)
-          ) {
-            throw err
-          }
-          attempt++
-          if (attempt > MAX_RETRIES) {
-            throw new Error(`Connection ${index + 1} failed: ${message}`)
-          }
-          await sleep(Math.min(5000, 350 * Math.pow(2, attempt)), handle.signal)
-        } finally {
-          handle.signal.removeEventListener('abort', relay)
-        }
-      }
-    }
-
+  private async readCheckpoint(stage: string): Promise<Checkpoint | undefined> {
+    const path = join(stage, 'checkpoint.json')
     try {
-      await Promise.all(segments.map((seg, i) => downloadSegment(seg, i)))
-      if (handle.signal.aborted) throw new DOMException('Aborted', 'AbortError')
-      await handleFs.close().catch(() => undefined)
-      await persist()
+      return checkpointShape.parse(JSON.parse((await readLocalFile(path, 64 * 1024)).toString('utf8')))
+    } catch (error) {
+      if (code(error) === 'ENOENT') return
+      throw new Error('The HTTP checkpoint is damaged. Its files were preserved.')
+    }
+  }
 
-      const finalSize = await fileSize(partPath)
-      if (state.size > 0 && finalSize !== state.size) {
-        throw new Error(`Incomplete file (${finalSize} of ${state.size} bytes)`)
-      }
-      await moveSafe(partPath, finalPath)
-      await fs.unlink(metaPath).catch(() => undefined)
+  async resumeWithUrl(task: DownloadTask, url: string, signal?: AbortSignal): Promise<{ size: number; restarted: boolean }> {
+    const probe = await this.probe(url, task.headers, undefined, signal)
+    const changed = digest(task.url) !== digest(url)
+    return { size: probe.size, restarted: task.downloaded > 0 && (changed || !probe.resumable) }
+  }
+
+  async start(handle: TaskHandle, _resume: boolean): Promise<void> {
+    try {
+      await this.transfer(handle)
+    } catch (error) {
+      const disk = code(error)
       handle.patch({
-        status: 'completed',
-        downloaded: state.size || finalSize,
-        size: state.size || finalSize,
-        completedAt: Date.now(),
-        filePath: finalPath,
-        fileName: finalPath.split(/[\\/]/).pop() as string,
-        connections: 0,
-        speed: 0,
-        eta: 0
-      })
-    } catch (err) {
-      await handleFs.close().catch(() => undefined)
-      await persist()
-      if (handle.signal.aborted || (err as Error).name === 'AbortError') {
-        handle.patch({ status: 'paused', speed: 0, eta: 0, connections: 0 })
-        return
-      }
-      const message = (err as Error).message || 'Download failed'
-      if (message.startsWith(LINK_EXPIRED_PREFIX)) {
-        const status = message.slice(LINK_EXPIRED_PREFIX.length)
-        handle.patch({
-          status: 'error',
-          error: `HTTP ${status}: the download link may have expired.`,
-          linkExpired: true,
-          speed: 0,
-          eta: 0,
-          connections: 0
-        })
-        return
-      }
-      if (message === 'RANGE_UNSUPPORTED' || message === 'RANGE_CHANGED') {
-        await fs.unlink(partPath).catch(() => undefined)
-        await fs.unlink(metaPath).catch(() => undefined)
-        if (message === 'RANGE_CHANGED') {
-          handle.toast('info', 'The file changed on the server. Restarting the download.')
-        }
-        await this.start({ ...handle, task: { ...task, filePath: undefined } }, false)
-        return
-      }
-      handle.patch({
-        status: 'error',
-        error: message,
-        speed: 0,
-        eta: 0,
-        connections: 0
+        status: handle.signal.aborted ? 'paused' : 'error',
+        ...(!handle.signal.aborted && {
+          error: disk === 'ENOSPC' ? 'The disk is full. Free some space and resume.' :
+            ['EACCES', 'EROFS', 'ENODEV', 'ENOENT', 'EIO', 'ESTALE'].includes(disk ?? '') ?
+              'The download folder is unavailable. Reconnect the volume or check permissions.' :
+              (error as Error).message,
+          linkExpired: linkExpired(error)
+        }),
+        speed: 0, eta: 0, connections: 0
       })
     }
   }
 
-  /** Fallback for servers that do not report a content length. */
-  private async streamUnknownSize(
-    handle: TaskHandle,
-    finalPath: string,
-    finalUrl: string
-  ): Promise<void> {
-    const task = handle.task
-    const partPath = `${finalPath}${PART_SUFFIX}`
-    const metaPath = `${finalPath}${META_SUFFIX}`
-    const controller = new AbortController()
-    const relay = (): void => controller.abort()
-    handle.signal.addEventListener('abort', relay, { once: true })
-    let fsHandle: FileHandle | null = null
-    let downloaded = 0
-    const started = Date.now()
-    try {
-      const res = await fetch(finalUrl, {
-        headers: this.baseHeaders(task),
-        signal: controller.signal,
-        redirect: 'follow'
-      })
-      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`)
-      if (!res.body) throw new Error('Empty response body')
-      fsHandle = await fs.open(partPath, 'w+')
-      handle.patch({
-        status: 'downloading',
-        connections: 1,
-        filePath: finalPath,
-        linkExpired: false
-      })
-      const reader = res.body.getReader()
+  private async transfer(handle: TaskHandle): Promise<void> {
+    const { task, signal } = handle
+    const stage = await this.stage(task, true)
+    const path = join(stage, 'checkpoint.json')
+    const previous = await this.readCheckpoint(stage)
+    // Recover a publication interrupted after the atomic link. Check both names
+    // refer to the task inode and verify the size before marking it complete.
+    if (previous?.publication && previous.source === digest(task.url)) {
+      const final = join(task.dir, previous.publication.name)
+      const published = await exists(final)
+      if (ownedFile(published, previous) && published.size === previous.publication.size) {
+        await this.verify(handle, final)
+        await this.complete(handle, stage, previous, final, published.size)
+        return
+      }
+    }
+
+    const probe = await this.probe(task.url, task.headers, undefined, signal)
+    signal.throwIfAborted()
+    let ranged = probe.resumable && !!probe.etag && probe.size > 0
+    const fileName = sanitizeFileName(task.fileName === guessNameFromUrl(task.url) || !task.fileName ? probe.fileName : task.fileName)
+    let checkpoint = previous
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const source = digest(task.url)
+      const resumed = ranged && checkpoint && checkpoint.source === source &&
+        checkpoint.validator === probe.etag && checkpoint.destination === digest(probe.finalUrl) && checkpoint.size === probe.size &&
+        validSegments(checkpoint.segments, probe.size) && !checkpoint.publication &&
+        ownedFile(await exists(fileFor(checkpoint, stage)), checkpoint)
+      let file: FileHandle
+      if (resumed && checkpoint) {
+        file = await fs.open(fileFor(checkpoint, stage), constants.O_RDWR | constants.O_NOFOLLOW)
+        const stat = await file.stat()
+        if (!ownedFile(stat, checkpoint) || checkpoint.segments.some((seg) => seg.position > seg.start && seg.position > stat.size)) {
+          await file.close()
+          throw new Error('The partial download was changed outside Pulse Mac.')
+        }
+      } else {
+        const part = randomUUID()
+        file = await fs.open(join(stage, `${part}.part`), 'wx+', 0o600)
+        const stat = await file.stat()
+        checkpoint = {
+          source, part, size: probe.size, identity: { dev: stat.dev, ino: stat.ino },
+          validator: probe.etag, modified: probe.lastModified, destination: digest(probe.finalUrl),
+          segments: ranged ? buildSegments(probe.size, task.maxConnections || this.host.settings().connections) : []
+        }
+      }
+      const state = checkpoint!
+      let downloaded = state.segments.reduce((sum, seg) => sum + seg.position - seg.start, 0)
+      let lastSave = 0
       let lastEmit = 0
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        if (!value?.byteLength) continue
-        const buf = Buffer.from(value.buffer, value.byteOffset, value.byteLength)
-        await fsHandle.write(buf, 0, buf.length, downloaded)
-        downloaded += buf.length
-        await this.host.throttle.consume(buf.length, handle.signal)
+      let writes = Promise.resolve()
+      let saveError: unknown
+      const controller = new AbortController()
+      const active = AbortSignal.any([signal, controller.signal])
+      const save = (): Promise<void> => {
+        const snapshot = JSON.stringify(state)
+        const op = writes.then(async () => {
+          await file.sync()
+          await atomicWrite(path, snapshot)
+        })
+        writes = op.catch((error) => { saveError = error; controller.abort(error) })
+        return op
+      }
+      const tick = (bytes: number): void => {
+        downloaded += bytes
         const now = Date.now()
-        if (now - lastEmit > 160) {
+        if (now - lastEmit >= 180) {
           lastEmit = now
-          handle.patch({ downloaded, size: 0 })
+          handle.patch({ downloaded, segments: state.segments.map((seg) => ({ ...seg })) })
+        }
+        if (ranged && now - lastSave >= 2000) {
+          lastSave = now
+          void save().catch(() => undefined)
         }
       }
-      await fsHandle.close()
-      fsHandle = null
-      await moveSafe(partPath, finalPath)
-      await fs.unlink(metaPath).catch(() => undefined)
-      handle.patch({
-        status: 'completed',
-        downloaded,
-        size: downloaded,
-        completedAt: Date.now(),
-        connections: 0,
-        speed: 0,
-        eta: 0,
-        filePath: finalPath,
-        fileName: finalPath.split(/[\\/]/).pop() as string,
-        resumable: false
-      })
-      void started
-    } catch (err) {
-      await fsHandle?.close().catch(() => undefined)
-      if (handle.signal.aborted || (err as Error).name === 'AbortError') {
-        handle.patch({ status: 'paused', downloaded, speed: 0, eta: 0, connections: 0 })
-        return
+
+      let retryWithoutRange = false
+      try {
+        const disk = await fs.statfs(stage)
+        if (probe.size - downloaded > disk.bavail * disk.bsize) {
+          throw Object.assign(new Error('The disk is full.'), { code: 'ENOSPC' })
+        }
+        await save()
+        handle.patch({
+          status: 'downloading', size: probe.size, downloaded, fileName,
+          connections: ranged ? state.segments.filter((s) => s.position < s.end).length : 1,
+          resumable: ranged, filePath: undefined, linkExpired: false
+        })
+        if (ranged) {
+          let firstError: unknown
+          const workers = state.segments.map(async (segment) => {
+            try {
+              await this.downloadRange(handle, file, segment, state, active, tick)
+            } catch (error) {
+              if (!firstError) firstError = error
+              controller.abort(error)
+            }
+          })
+          await Promise.all(workers)
+          if (saveError) throw saveError
+          if (firstError) throw firstError
+        } else {
+          downloaded = await this.readResponse(handle, active, this.headers(task.url, task.headers),
+            undefined, async (value, offset) => {
+              await writeAll(file, value, offset)
+              tick(value.length)
+            })
+        }
+        active.throwIfAborted()
+        const stat = await file.stat()
+        if (stat.size !== downloaded || (ranged && downloaded !== state.size)) {
+          throw new Error('The file length does not match the downloaded data.')
+        }
+        await save()
+      } catch (error) {
+        await writes
+        if (ranged && !saveError) await save()
+        if (!signal.aborted && ranged && error instanceof RangeRejected) retryWithoutRange = true
+        else throw saveError || error
+      } finally {
+        await writes
+        await file.close()
       }
-      const message = (err as Error).message || 'Download failed'
-      handle.patch({
-        status: 'error',
-        error: message,
-        linkExpired: /^HTTP (401|403|404|410)\b/.test(message) || task.linkExpired,
-        downloaded,
-        speed: 0,
-        eta: 0,
-        connections: 0
-      })
-    } finally {
-      handle.signal.removeEventListener('abort', relay)
+      if (retryWithoutRange) {
+        handle.toast('info', 'The server rejected range requests. Restarting with one connection.')
+        ranged = false
+        continue
+      }
+
+      handle.patch({ status: 'verifying', connections: 0 })
+      const part = fileFor(state, stage)
+      await this.verify(handle, part)
+      signal.throwIfAborted()
+      await this.publish(handle, stage, state, fileName, downloaded)
+      return
     }
   }
 
-  private buildSegments(size: number, connections: number): SegmentState[] {
-    if (size <= 0) {
-      return [{ start: 0, end: Number.MAX_SAFE_INTEGER, position: 0 }]
+  private async downloadRange(
+    handle: TaskHandle, file: FileHandle, segment: SegmentState, state: Checkpoint,
+    signal: AbortSignal, tick: (bytes: number) => void
+  ): Promise<void> {
+    for (let attempt = 0; segment.position < segment.end; attempt++) {
+      signal.throwIfAborted()
+      const start = segment.position
+      const headers = this.headers(handle.task.url, handle.task.headers)
+      headers.set('Range', `bytes=${start}-${segment.end - 1}`)
+      headers.set('If-Range', state.validator!)
+      try {
+        await this.readResponse(handle, signal, headers, { start, end: segment.end - 1, state }, async (value, offset) => {
+          await writeAll(file, value, start + offset)
+          const next = start + offset + value.length
+          // Keep the last chunk out of the checkpoint until EOF is validated.
+          if (next < segment.end) {
+            const committed = next - segment.position
+            segment.position = next
+            tick(committed)
+          }
+        })
+        const committed = segment.end - segment.position
+        segment.position = segment.end
+        tick(committed)
+      } catch (error) {
+        if (signal.aborted || error instanceof RangeRejected || linkExpired(error) || code(error) ||
+          (error instanceof HttpError && error.status < 500 && ![408, 429].includes(error.status)) || attempt >= 4) throw error
+        await sleep(200 * 2 ** attempt + Math.random() * 150, signal)
+      }
     }
-    const maxUseful = Math.ceil(size / (1024 * 1024))
-    const count = Math.max(1, Math.min(connections, maxUseful))
-    const chunk = Math.floor(size / count)
-    const segments: SegmentState[] = []
-    for (let i = 0; i < count; i++) {
-      const start = i * chunk
-      const end = i === count - 1 ? size : start + chunk
-      segments.push({ start, end, position: start })
-    }
-    return segments
   }
+
+  private async readResponse(
+    handle: TaskHandle, signal: AbortSignal, headers: Headers,
+    expected: { start: number; end: number; state: Checkpoint } | undefined,
+    write: (chunk: Uint8Array, offset: number) => Promise<void>
+  ): Promise<number> {
+    const controller = new AbortController()
+    const active = AbortSignal.any([signal, controller.signal])
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    const armTimeout = (): void => {
+      clearTimeout(timeout)
+      timeout = setTimeout(() => controller.abort(new Error('Download connection timed out.')), 20_000)
+    }
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
+    try {
+      armTimeout()
+      const res = await this.network.request(handle.task.url, headers, active)
+      reader = res.body?.getReader()
+      if (!res.ok && res.status !== 416) throw new HttpError(res.status)
+      let length = identity(res) ? contentLength(res) : undefined
+      if (expected) {
+        const range = contentRange(res)
+        const bytes = expected.end + 1 - expected.start
+        if (res.status !== 206 || !identity(res) || !range || range.start !== expected.start ||
+          range.end !== expected.end || range.size !== expected.state.size ||
+          digest(res.url || handle.task.url) !== expected.state.destination ||
+          strongEtag(res.headers.get('etag')) !== expected.state.validator ||
+          (expected.state.modified && res.headers.get('last-modified') !== expected.state.modified) ||
+          (length !== undefined && length !== bytes)) throw new RangeRejected()
+        length = bytes
+      } else if (res.status !== 200) throw new HttpError(res.status)
+      if (!reader) {
+        if (length === 0) return 0
+        throw new Error('Empty response body.')
+      }
+
+      let offset = 0
+      while (true) {
+        armTimeout()
+        const { done, value } = await reader.read()
+        clearTimeout(timeout)
+        if (done) break
+        if (!value?.length) continue
+        active.throwIfAborted()
+        if (length !== undefined && offset + value.length > length) {
+          if (expected) throw new RangeRejected()
+          throw new Error('Server sent more bytes than expected.')
+        }
+        await this.host.throttle.consume(value.length, active)
+        active.throwIfAborted()
+        await write(value, offset)
+        offset += value.length
+      }
+      if (length !== undefined && length !== offset) throw new Error('Server ended the response early.')
+      return offset
+    } finally {
+      clearTimeout(timeout)
+      controller.abort()
+      await reader?.cancel().catch(() => undefined)
+    }
+  }
+
+  private async verify(handle: TaskHandle, path: string): Promise<void> {
+    if (!handle.task.checksum) return
+    const hash = createHash('sha256')
+    for await (const chunk of createReadStream(path, {
+      flags: 'r', signal: handle.signal
+    })) hash.update(chunk)
+    if (hash.digest('hex') !== handle.task.checksum.toLowerCase()) throw new Error('SHA-256 checksum does not match.')
+  }
+
+  private async publish(handle: TaskHandle, stage: string, state: Checkpoint, fileName: string, size: number): Promise<void> {
+    const ext = extname(fileName)
+    const stem = fileName.slice(0, fileName.length - ext.length)
+    const part = fileFor(state, stage)
+    for (let i = 0; i <= 10_000; i++) {
+      handle.signal.throwIfAborted()
+      const name = i ? `${stem} (${i})${ext}` : fileName
+      const candidate = join(handle.task.dir, name)
+      if (await exists(candidate)) continue
+      state.publication = { name, size }
+      await atomicWrite(join(stage, 'checkpoint.json'), JSON.stringify(state))
+      handle.signal.throwIfAborted()
+      try {
+        await fs.link(part, candidate)
+      } catch (error) {
+        if (code(error) === 'EEXIST') continue
+        throw error
+      }
+      await syncDirectory(handle.task.dir)
+      await this.complete(handle, stage, state, candidate, size)
+      return
+    }
+    throw new Error('Could not reserve a unique file name.')
+  }
+
+  private async complete(handle: TaskHandle, stage: string, state: Checkpoint, final: string, size: number): Promise<void> {
+    const part = fileFor(state, stage)
+    const original = await exists(part)
+    const published = await exists(final)
+    if (!ownedFile(published, state) || (original && !sameFile(original, published))) {
+      throw new Error('The completed file changed before publication.')
+    }
+    if (original) await fs.unlink(part)
+    handle.patch({
+      status: 'completed', downloaded: size, size, filePath: final, fileName: basename(final),
+      completedAt: Date.now(), connections: 0, speed: 0, eta: 0
+    })
+  }
+
+  async deleteOwnedFiles(task: DownloadTask): Promise<void> {
+    let stage: string
+    try { stage = await this.stage(task, false) } catch (error) {
+      if (code(error) === 'ENOENT') return
+      throw error
+    }
+    const state = await this.readCheckpoint(stage)
+    if (!state) return
+    const part = fileFor(state, stage)
+    if (state.publication && state.source === digest(task.url)) {
+      const path = join(task.dir, state.publication.name)
+      const stat = await exists(path)
+      if (ownedFile(stat, state) && stat.size === state.publication.size) await fs.unlink(path)
+    }
+    if (ownedFile(await exists(part), state)) await fs.unlink(part)
+    await fs.unlink(join(stage, 'checkpoint.json'))
+    await fs.rmdir(stage).catch((error) => { if (code(error) !== 'ENOTEMPTY') throw error })
+  }
+
+  shutdown(): Promise<void> { return this.network.close() }
 }

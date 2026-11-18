@@ -260,7 +260,7 @@ const en = {
       autoResume: 'Resume unfinished downloads on launch',
       autoResumeHint: 'Continue where you left off when Pulse starts.',
       launchAtStartup: 'Launch Pulse when the system starts',
-      launchAtStartupHint: 'Automatically start Pulse after you sign in to Windows or Linux.',
+      launchAtStartupHint: 'Automatically start Pulse Mac when you log in to macOS.',
       launchAtStartupUnsupported: 'Auto-start is available in the installed version, not the portable build.',
       notify: 'Show a notification when a download finishes',
       clipboard: 'Watch the clipboard for links',
@@ -319,7 +319,7 @@ const en = {
       githubTokenPlaceholder: 'ghp_… (optional)'
     },
     about: {
-      built: 'Download manager for Windows and Linux.',
+      built: 'Download manager for Apple Silicon Macs.',
       features: 'Multi-connection HTTP engine · yt-dlp video engine · BitTorrent · GitHub browser · RTL interface',
       version: 'Version',
       platform: 'Platform',
@@ -676,7 +676,7 @@ const fa: typeof en = {
       autoResume: 'ادامه دانلودهای نیمه‌کاره در اجرای بعدی',
       autoResumeHint: 'هنگام بازشدن پالس، از همان‌جا که رها شدید ادامه دهید.',
       launchAtStartup: 'اجرای خودکار پالس هنگام روشن‌شدن سیستم',
-      launchAtStartupHint: 'پس از ورود به ویندوز یا لینوکس، پالس به‌صورت خودکار اجرا شود.',
+      launchAtStartupHint: 'پس از ورود به macOS، پالس به‌صورت خودکار اجرا شود.',
       launchAtStartupUnsupported: 'اجرای خودکار فقط در نسخهٔ نصب‌شده فعال است، نه نسخهٔ Portable.',
       notify: 'نمایش اعلان پس از پایان دانلود',
       clipboard: 'پایش حافظه موقت برای یافتن لینک',
@@ -735,7 +735,7 @@ const fa: typeof en = {
       githubTokenPlaceholder: 'ghp_… (اختیاری)'
     },
     about: {
-      built: 'دانلود منیجر برای ویندوز و لینوکس.',
+      built: 'دانلود منیجر برای macOS.',
       features: 'موتور HTTP چنداتصاله · موتور ویدیو yt-dlp · بیت‌تورنت · مرورگر گیت‌هاب · رابط راست‌به‌چپ',
       version: 'نسخه',
       platform: 'پلتفرم',

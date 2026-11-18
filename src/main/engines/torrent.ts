@@ -3,467 +3,328 @@ import { promises as fs } from 'node:fs'
 import { app } from 'electron'
 import type { DownloadTask, TorrentFileEntry } from '@shared/types'
 import type { EngineHost, TaskHandle } from './http'
-import { ensureDir } from '../util'
+import { sanitizeFileName } from '../util'
+import { atomicWrite, readLocalFile } from '../durable-file'
+import { httpUrl, MAX_TORRENT_BYTES } from '../validate'
+import { HttpNetwork } from './http-network'
+import { validateTorrentPaths } from './torrent-path'
 
-type AnyTorrent = any
+type Client = any
+type Torrent = any
+type TorrentFile = TorrentFileEntry & { done: boolean; select(): void; deselect(): void }
 
-interface TorrentSession {
-  torrent: AnyTorrent
+interface Session {
+  torrent: Torrent
   handle: TaskHandle
-  paused: boolean
+  dir: string
+  metadata: boolean
+  ready: boolean
+  started: boolean
+  finishing: boolean
+  closing?: Promise<void>
+  selected: Set<number> | undefined
+  finish: () => void
 }
 
-const clean = (name: string): string => name.replace(/[\\/]+/g, '/')
+const MAX_WAIT = 60_000
 
 export class TorrentEngine {
-  private host: EngineHost
-  private client: any = null
-  private initPromise: Promise<any> | null = null
-  private sessions = new Map<string, TorrentSession>()
-  private poll: NodeJS.Timeout | null = null
-  state: 'idle' | 'ready' | 'starting' | 'unavailable' = 'idle'
-  private lastError = ''
+  private client: Client
+  private initializing?: Promise<Client>
+  private sessions = new Map<string, Session>()
+  private poll?: ReturnType<typeof setInterval>
   private destroyed = false
+  private state: 'idle' | 'ready' | 'starting' | 'unavailable' = 'idle'
+  private network: HttpNetwork
 
-  constructor(host: EngineHost) {
-    this.host = host
+  constructor(private host: EngineHost) {
+    this.network = new HttpNetwork(host.resolveProxy?.bind(host))
   }
 
-  async init(): Promise<any> {
-    if (this.client) return this.client
-    if (this.initPromise) return this.initPromise
+  init(): Promise<Client> {
+    if (this.destroyed) return Promise.reject(new Error('Torrent engine is shutting down.'))
+    if (this.client) return Promise.resolve(this.client)
+    if (this.initializing) return this.initializing
     this.state = 'starting'
-    this.initPromise = (async () => {
-      try {
-        const mod: any = await import('webtorrent')
-        const Ctor = mod?.default?.WebTorrent || mod?.default || mod?.WebTorrent || mod
-        const settings = this.host.settings()
-        const desiredPort = settings.torrentPort || 0
+    this.initializing = this.createClient().finally(() => { this.initializing = undefined })
+    return this.initializing
+  }
 
-        const create = (port: number): any =>
-          new Ctor({
-            maxConns: 80,
-            torrentPort: port,
-            dht: true,
-            tracker: true,
-            utp: false,
-            webSeeds: true
-          })
-
-        const waitForListening = (client: any): Promise<Error | null> =>
-          new Promise((resolve) => {
-            let settled = false
-            const onListening = (): void => {
-              if (settled) return
-              settled = true
-              cleanup()
-              resolve(null)
-            }
-            const onError = (err: Error): void => {
-              if (settled) return
-              settled = true
-              cleanup()
-              resolve(err)
-            }
-            const cleanup = (): void => {
-              client.off('listening', onListening)
-              client.off('error', onError)
-            }
-            client.once('listening', onListening)
-            client.once('error', onError)
-          })
-
-        let client = create(desiredPort)
-        const listenError = await waitForListening(client)
-
-        // The configured port may be taken by another torrent client (or blocked
-        // by the OS). Fall back to an OS-assigned port so downloads still work.
-        if (listenError) {
-          console.warn('[torrent] could not listen on port', desiredPort, '-', listenError.message)
+  private async createClient(): Promise<Client> {
+    try {
+      const { default: WebTorrent } = await import('webtorrent')
+      const client: Client = new WebTorrent({
+        maxConns: 40,
+        torrentPort: this.host.settings().torrentPort,
+        dht: true,
+        tracker: false,
+        lsd: false,
+        utp: false,
+        webSeeds: false,
+        blocklist: [
+          { start: '0.0.0.0', end: '0.255.255.255' }, { start: '10.0.0.0', end: '10.255.255.255' },
+          { start: '127.0.0.0', end: '127.255.255.255' }, { start: '169.254.0.0', end: '169.254.255.255' },
+          { start: '172.16.0.0', end: '172.31.255.255' }, { start: '192.168.0.0', end: '192.168.255.255' },
+          { start: '::', end: '::1' }, { start: 'fc00::', end: 'fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff' },
+          { start: 'fe80::', end: 'febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff' }
+        ]
+      })
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => fail(new Error('Torrent listener timed out.')), 10_000)
+        const ready = (): void => { clearTimeout(timeout); client.off('error', fail); resolve() }
+        const fail = (error: Error): void => {
+          clearTimeout(timeout)
+          client.off('listening', ready)
           client.destroy(() => undefined)
-          client = create(0)
-          const retryError = await waitForListening(client)
-          if (retryError) {
-            console.error('[torrent] could not listen on a fallback port:', retryError.message)
+          reject(error)
+        }
+        client.once('error', fail)
+        client.once('listening', ready)
+      })
+      client.on('error', () => this.host.toast('error', 'The torrent engine reported a network error.'))
+      this.client = client
+      this.setLimit(this.host.settings().globalSpeedLimit)
+      this.state = 'ready'
+      return client
+    } catch {
+      this.state = 'unavailable'
+      throw new Error('Could not start the torrent listener. Check the configured port.')
+    }
+  }
+
+  private async source(task: DownloadTask, signal: AbortSignal): Promise<Buffer | string> {
+    if (task.torrent?.torrentFile) {
+      const path = join(app.getPath('userData'), 'torrents', `${task.id}.torrent`)
+      if (path !== task.torrent.torrentFile) {
+        throw new Error('Choose the legacy torrent file again to create a Pulse Mac task.')
+      }
+      return readLocalFile(path, MAX_TORRENT_BYTES)
+    }
+    if (/^magnet:/i.test(task.url)) {
+      const params = new URL(task.url).searchParams
+      const xt = params.getAll('xt').find((value) => /^urn:btih:(?:[a-f0-9]{40}|[a-z2-7]{32})$/i.test(value))
+      if (!xt) throw new Error('The magnet link has no valid BitTorrent v1 info hash.')
+      return `magnet:?xt=${xt}`
+    }
+    if (/^https?:/i.test(task.url)) {
+      const active = AbortSignal.any([signal, AbortSignal.timeout(20_000)])
+      const response = await this.network.request(httpUrl.parse(task.url), new Headers(), active)
+      const reader = response.body?.getReader()
+      let size = 0
+      const parts: Uint8Array[] = []
+      try {
+        if (!response.ok || !reader) throw new Error('Could not read the remote torrent file.')
+        while (true) {
+          const { value, done } = await reader.read()
+          if (done) break
+          size += value.length
+          if (size > MAX_TORRENT_BYTES) throw new Error('The torrent file is too large.')
+          parts.push(value)
+        }
+        return Buffer.concat(parts)
+      } finally {
+        await reader?.cancel().catch(() => undefined)
+      }
+    }
+    throw new Error('Choose a torrent file or a valid magnet link.')
+  }
+
+  private async workDir(task: DownloadTask): Promise<string> {
+    if (await fs.realpath(task.dir) !== task.dir) throw new Error('The torrent destination moved.')
+    const dir = join(task.dir, `Torrent [${task.id}]`)
+    await fs.mkdir(dir, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'EEXIST') throw error })
+    if (!(await fs.lstat(dir)).isDirectory() || await fs.realpath(dir) !== dir) {
+      throw new Error('Choose a regular torrent destination.')
+    }
+    return dir
+  }
+
+  async startOrResume(handle: TaskHandle): Promise<void> {
+    const { task, signal } = handle
+    const [source, dir, client, { default: Storage }] = await Promise.all([
+      this.source(task, signal), this.workDir(task), this.init(), import('fs-chunk-store')
+    ])
+    signal.throwIfAborted()
+    await new Promise<void>((resolve, reject) => {
+      let session: Session
+      let failure: Error | undefined
+      const fail = (message: string): void => {
+        if (signal.aborted) return
+        failure ??= new Error(message)
+        void this.remove(task.id).catch(reject)
+      }
+      class SafeStorage {
+        constructor(length: number, opts: { length: number; files: TorrentFile[]; path: string }) {
+          try {
+            validateTorrentPaths(dir, opts.files)
+            return new Storage(length, opts)
+          } catch {
+            queueMicrotask(() => fail('Unsafe or conflicting file paths in torrent metadata.'))
+            const closed = (done: () => void): void => queueMicrotask(done)
+            return {
+              put: (_index: number, _data: Buffer, cb: (error: Error) => void) =>
+                queueMicrotask(() => cb(new Error('Torrent store rejected.'))),
+              get: (_index: number, _opts: unknown, cb: (error: Error) => void) =>
+                queueMicrotask(() => cb(new Error('Torrent store rejected.'))),
+              close: closed, destroy: closed
+            } as unknown as SafeStorage
           }
         }
-
-        client.on('error', (err: Error) => {
-          this.lastError = err?.message || String(err)
-          console.error('[torrent] client error:', this.lastError)
-          if (/EPERM|EACCES|EADDRINUSE/i.test(this.lastError)) {
-            this.host.toast(
-              'error',
-              'Torrent port is busy. Downloads will continue over outgoing connections.'
-            )
-          }
-        })
-        client.on('warning', (err: Error) => {
-          console.warn('[torrent] warning:', err?.message)
-        })
-        this.client = client
-        this.state = 'ready'
-        this.startPolling()
-        return client
-      } catch (err) {
-        this.state = 'unavailable'
-        this.lastError = (err as Error).message
-        console.error('[torrent] failed to initialise engine:', err)
-        this.host.toast('error', 'Torrent engine could not start on this system.')
-        throw err
-      } finally {
-        this.initPromise = null
       }
-    })()
-    return this.initPromise
+      const torrent: Torrent = client.add(source, {
+        path: dir, store: SafeStorage, storeCacheSlots: 8,
+        strategy: task.torrent?.sequential ? 'sequential' : 'rarest',
+        deselect: true, destroyStoreOnDestroy: false
+      })
+      const timeout = setTimeout(() => fail('Timed out waiting for torrent metadata and verification.'), MAX_WAIT)
+      const stop = (): void => { void this.remove(task.id) }
+      const finish = (): void => {
+        clearTimeout(timeout)
+        signal.removeEventListener('abort', stop)
+        if (failure) reject(failure)
+        else resolve()
+      }
+      session = {
+        torrent, handle, dir, metadata: false, ready: false, started: false, finishing: false,
+        selected: task.torrent?.fileIndices ? new Set(task.torrent.fileIndices) : undefined,
+        finish
+      }
+      this.sessions.set(task.id, session)
+      this.poll ??= setInterval(() => this.tick(), 1000)
+      signal.addEventListener('abort', stop, { once: true })
+      torrent.once('error', () => fail('Invalid, duplicate or inaccessible torrent.'))
+      torrent.once('metadata', () => {
+        if (torrent.destroyed || signal.aborted) return
+        void this.saveMetadata(session).then(() => {
+          if (torrent.destroyed || signal.aborted) return
+          session.metadata = true
+          this.begin(session)
+        }, () => fail('Could not save the torrent metadata.'))
+      })
+      torrent.once('ready', () => {
+        session.ready = true
+        clearTimeout(timeout)
+        if (!torrent.destroyed && !signal.aborted) this.begin(session)
+      })
+    })
   }
 
-  private startPolling(): void {
-    if (this.poll || this.destroyed) return
-    this.poll = setInterval(() => this.tick(), 1000)
+  private async saveMetadata(session: Session): Promise<void> {
+    const { task } = session.handle
+    const data = Buffer.from(session.torrent.torrentFile)
+    if (!data.length || data.length > MAX_TORRENT_BYTES) throw new Error('Torrent metadata is too large.')
+    const folder = join(app.getPath('userData'), 'torrents')
+    await fs.mkdir(folder, { recursive: true, mode: 0o700 })
+    const path = join(folder, `${task.id}.torrent`)
+    if (task.torrent?.torrentFile !== path) await atomicWrite(path, data)
+    if (!session.handle.signal.aborted && task.torrent) {
+      session.handle.patch({ torrent: { ...task.torrent, torrentFile: path } })
+    }
+  }
+
+  private begin(session: Session): void {
+    if (!session.ready || !session.metadata || session.handle.task.status !== 'connecting') return
+    const { torrent, handle } = session
+    session.started = true
+    this.updateSelection(session)
+    handle.patch({ status: 'downloading', name: sanitizeFileName(torrent.name), fileName: sanitizeFileName(torrent.name) })
+    this.update(session)
+  }
+
+  private updateSelection(session: Session): void {
+    const { torrent, selected } = session
+    torrent.files.forEach((file: TorrentFile, i: number) => {
+      if (!selected || selected.has(i)) file.select()
+    })
+  }
+
+  selectFiles(id: string, indices: number[]): void {
+    const session = this.sessions.get(id)
+    if (!session?.started || session.finishing) return
+    const previous = session.selected
+    const next = new Set(indices)
+    session.torrent.files.forEach((file: TorrentFile, index: number) => {
+      const wasSelected = !previous || previous.has(index)
+      if (wasSelected && !next.has(index)) file.deselect()
+      else if (!wasSelected && next.has(index)) file.select()
+    })
+    session.selected = next
+    this.update(session)
   }
 
   private tick(): void {
     for (const session of this.sessions.values()) {
-      const { torrent, handle } = session
-      if (!torrent || handle.task.status === 'paused') continue
-      const task = handle.task
-      const files: TorrentFileEntry[] = (torrent.files || []).map((f: any, i: number) => ({
-        name: f.name,
-        path: clean(f.path),
-        length: f.length,
-        downloaded: typeof f.downloaded === 'number' ? f.downloaded : 0,
-        selected: typeof f.selected === 'boolean' ? f.selected : true
-      }))
-      const totalLength = torrent.length || 0
-      const downloaded = Math.min(torrent.downloaded || 0, totalLength || Number.MAX_SAFE_INTEGER)
-      handle.patch({
-        downloaded,
-        size: totalLength || task.size,
-        connections: torrent.numPeers || 0,
-        torrent: {
-          infoHash: torrent.infoHash || task.torrent?.infoHash || '',
-          magnet: torrent.magnetURI || task.torrent?.magnet,
-          torrentFile: task.torrent?.torrentFile,
-          peers: torrent.numPeers || 0,
-          seeds: 0,
-          uploadSpeed: torrent.uploadSpeed || 0,
-          uploaded: torrent.uploaded || 0,
-          ratio: torrent.ratio || 0,
-          files: files.length ? files : task.torrent?.files || [],
-          sequential: !!(torrent as any).sequential,
-          seeding: !!torrent.done
-        }
-      })
-      if (torrent.done && task.status !== 'completed') {
-        const target = this.primaryPath(torrent, task)
-        handle.patch({
-          status: 'completed',
-          downloaded: totalLength || task.downloaded,
-          size: totalLength || task.size,
-          completedAt: Date.now(),
-          connections: 0,
-          speed: 0,
-          eta: 0,
-          filePath: target
-        })
-        if (!this.host.settings().seedAfterComplete) {
-          this.removeSilently(task)
-        }
-      }
+      if (!session.started || session.finishing || session.handle.signal.aborted) continue
+      this.update(session)
     }
   }
 
-  private primaryPath(torrent: AnyTorrent, task: DownloadTask): string | undefined {
-    const base = torrent.path || task.dir
-    if (torrent.files?.length === 1) return join(base, torrent.files[0].path)
-    return join(base, torrent.name || task.name)
-  }
-
-  private removeSilently(task: DownloadTask): void {
-    const session = this.sessions.get(task.id)
-    if (!session || !this.client) return
-    this.sessions.delete(task.id)
-    try {
-      this.client.remove(session.torrent, { destroyStore: false }, () => undefined)
-    } catch {
-      /* ignore */
-    }
-    if (task.torrent?.seeding) {
-      this.host.patch(task, { torrent: { ...task.torrent, seeding: false } })
-    }
-  }
-
-  private async saveTorrentFile(torrent: AnyTorrent): Promise<string | undefined> {
-    try {
-      if (!torrent.torrentFile || !torrent.infoHash) return undefined
-      const dir = join(app.getPath('userData'), 'torrents')
-      await fs.mkdir(dir, { recursive: true })
-      const target = join(dir, `${torrent.infoHash}.torrent`)
-      await fs.writeFile(target, Buffer.from(torrent.torrentFile))
-      return target
-    } catch {
-      return undefined
-    }
-  }
-
-  async start(
-    handle: TaskHandle,
-    input: { uri?: string; data?: Buffer; torrentFile?: string; sequential?: boolean; fileIndices?: number[] }
-  ): Promise<void> {
-    const task = handle.task
-    const client = await this.init()
-    await ensureDir(task.dir)
-    const settings = this.host.settings()
-
-    const source: any =
-      input.data ||
-      input.torrentFile ||
-      (input.uri?.startsWith('base64:') ? Buffer.from(input.uri.slice(7), 'base64') : input.uri)
-
-    handle.patch({ status: 'connecting', error: undefined })
-
-    return new Promise<void>((resolve) => {
-      let settled = false
-      const settle = (): void => {
-        if (settled) return
-        settled = true
-        resolve()
+  private update(session: Session): void {
+    const { torrent, handle, selected, dir } = session
+    if (torrent.destroyed || !handle.task.torrent) return
+    const files: TorrentFileEntry[] = torrent.files.map((file: TorrentFile, i: number) => ({
+      name: sanitizeFileName(file.name), path: file.path, length: file.length,
+      downloaded: file.done ? file.length : Math.max(0, Math.min(file.length, file.downloaded || 0)),
+      selected: !selected || selected.has(i)
+    }))
+    const wanted = files.filter((file) => file.selected)
+    const size = wanted.reduce((total, file) => total + file.length, 0)
+    const downloaded = wanted.reduce((total, file) => total + file.downloaded, 0)
+    const done = wanted.length > 0 && torrent.files.every((file: TorrentFile, i: number) => selected && !selected.has(i) || file.done)
+    const seeding = Boolean(done && torrent.done && this.host.settings().seedAfterComplete)
+    handle.patch({
+      size, downloaded, connections: done ? 0 : torrent.numPeers || 0,
+      torrent: {
+        ...handle.task.torrent, infoHash: torrent.infoHash || '', peers: torrent.numPeers || 0,
+        uploadSpeed: torrent.uploadSpeed || 0, uploaded: torrent.uploaded || 0,
+        ratio: Number.isFinite(torrent.ratio) ? torrent.ratio : 0,
+        files, seeding
       }
-
-      const addOptions: Record<string, unknown> = {
-        path: task.dir,
-        announce: []
-      }
-      if (input.sequential ?? true) addOptions.sequential = true
-      if (settings.globalSpeedLimit > 0) {
-        try {
-          client.throttleDownload(settings.globalSpeedLimit)
-        } catch {
-          /* older versions */
-        }
-      }
-
-      let torrent: AnyTorrent
-      try {
-        torrent = client.add(source, addOptions)
-      } catch (err) {
-        handle.patch({
-          status: 'error',
-          error: `Invalid torrent: ${(err as Error).message}`,
-          connections: 0
-        })
-        settle()
-        return
-      }
-
-      const session: TorrentSession = { torrent, handle, paused: false }
-      this.sessions.set(task.id, session)
-
-      torrent.on('error', (err: Error) => {
-        if (handle.signal.aborted) return
-        handle.patch({
-          status: 'error',
-          error: err?.message || 'Torrent error',
-          speed: 0,
-          eta: 0,
-          connections: 0
-        })
-        settle()
-      })
-
-      torrent.on('warning', (err: Error) => {
-        console.warn('[torrent] warning:', err?.message)
-      })
-
-      torrent.on('metadata', async () => {
-        const saved = await this.saveTorrentFile(torrent)
-        handle.patch({
-          name: torrent.name || task.name,
-          fileName: torrent.name || task.fileName,
-          size: torrent.length || 0,
-          status: 'downloading',
-          torrent: {
-            infoHash: torrent.infoHash || '',
-            magnet: torrent.magnetURI || input.uri,
-            torrentFile: saved || input.torrentFile,
-            peers: torrent.numPeers || 0,
-            seeds: 0,
-            uploadSpeed: torrent.uploadSpeed || 0,
-            uploaded: 0,
-            ratio: 0,
-            files: (torrent.files || []).map((f: any) => ({
-              name: f.name,
-              path: clean(f.path),
-              length: f.length,
-              downloaded: 0,
-              selected: true
-            })),
-            sequential: !!torrent.sequential,
-            seeding: false
-          }
-        })
-        if (input.fileIndices?.length) {
-          torrent.files?.forEach((file: any, i: number) => {
-            if (!input.fileIndices?.includes(i)) file.deselect()
-          })
-        }
-        // Apply a per-torrent speed cap without throttling other engines globally.
-        settle()
-      })
-
-      torrent.on('ready', () => {
-        handle.patch({ status: 'downloading', connections: torrent.numPeers || 0 })
-        settle()
-      })
-
-      torrent.on('done', () => {
-        const target = this.primaryPath(torrent, task)
-        handle.patch({
-          status: 'completed',
-          downloaded: torrent.length,
-          size: torrent.length,
-          completedAt: Date.now(),
-          speed: 0,
-          eta: 0,
-          connections: 0,
-          filePath: target,
-          torrent: {
-            ...(task.torrent || {
-              infoHash: torrent.infoHash,
-              peers: 0,
-              seeds: 0,
-              uploadSpeed: 0,
-              uploaded: 0,
-              ratio: 0,
-              files: [],
-              sequential: true,
-              seeding: false
-            }),
-            infoHash: torrent.infoHash,
-            seeding: true
-          }
-        })
-        if (!this.host.settings().seedAfterComplete) {
-          setTimeout(() => this.removeSilently(task), 1200)
-        }
-        settle()
-      })
-
-      // Magnet links: resolves once we have metadata, or after a timeout so the
-      // queue never stalls while the DHT is still warming up.
-      const timeout = setTimeout(settle, 45_000)
-      torrent.once('metadata', () => clearTimeout(timeout))
-      torrent.once('ready', () => clearTimeout(timeout))
-
-      handle.signal.addEventListener(
-        'abort',
-        () => {
-          clearTimeout(timeout)
-          this.pauseInternal(task.id)
-          settle()
-        },
-        { once: true }
-      )
     })
+    if (!done || handle.task.status === 'completed') return
+    handle.patch({
+      status: 'completed', completedAt: Date.now(), speed: 0, eta: 0,
+      filePath: wanted.length === 1 && wanted[0].length > 0 ? join(dir, wanted[0].path) : dir
+    })
+    if (seeding) session.finish()
+    else void this.remove(handle.task.id)
   }
 
-  private pauseInternal(taskId: string): void {
-    const session = this.sessions.get(taskId)
+  pause(id: string): void { void this.remove(id) }
+
+  async remove(id: string): Promise<void> {
+    const session = this.sessions.get(id)
     if (!session) return
-    session.paused = true
-    const { torrent } = session
-    try {
-      if (typeof torrent.pause === 'function') torrent.pause()
-      else if (typeof torrent.deselect === 'function' && torrent.pieces?.length) {
-        torrent.deselect(0, torrent.pieces.length - 1, false)
+    if (session.closing) return session.closing
+    session.finishing = true
+    const closing = new Promise<void>((resolve) => {
+      if (session.torrent.destroyed) resolve()
+      else session.torrent.destroy({ destroyStore: false }, () => resolve())
+    }).then(() => {
+      this.sessions.delete(id)
+      if (!this.sessions.size) {
+        clearInterval(this.poll)
+        this.poll = undefined
       }
-    } catch {
-      /* ignore */
-    }
-    session.handle.patch({ status: 'paused', speed: 0, eta: 0, connections: 0 })
-  }
-
-  pause(taskId: string): void {
-    this.pauseInternal(taskId)
-  }
-
-  async startOrResume(
-    handle: TaskHandle,
-    input: { uri?: string; data?: Buffer; torrentFile?: string; sequential?: boolean; fileIndices?: number[] }
-  ): Promise<void> {
-    const session = this.sessions.get(handle.task.id)
-    if (session?.torrent) {
-      session.handle = handle
-      session.paused = false
-      try {
-        if (typeof session.torrent.resume === 'function') session.torrent.resume()
-        if (typeof session.torrent.select === 'function' && session.torrent.pieces?.length) {
-          session.torrent.select(0, session.torrent.pieces.length - 1, 1)
-        }
-        this.sessions.set(handle.task.id, session)
-        handle.patch({ status: 'downloading', error: undefined, connections: session.torrent.numPeers || 0 })
-        return
-      } catch {
-        removeSessionSilently(this.client, session.torrent)
-        this.sessions.delete(handle.task.id)
-      }
-    }
-    await this.start(handle, input)
-  }
-
-  async remove(taskId: string): Promise<void> {
-    const session = this.sessions.get(taskId)
-    this.sessions.delete(taskId)
-    if (session && this.client) {
-      await new Promise<void>((resolve) => {
-        try {
-          this.client.remove(session.torrent, { destroyStore: false }, () => resolve())
-        } catch {
-          resolve()
-        }
-      })
-    }
+      session.finish()
+    })
+    session.closing = closing
+    return closing
   }
 
   setLimit(limit: number): void {
-    if (!this.client) return
-    try {
-      this.client.throttleDownload(limit)
-      this.client.throttleUpload(0)
-    } catch {
-      /* ignore */
-    }
+    this.client?.throttleDownload(limit || -1)
+    this.client?.throttleUpload(this.host.settings().seedAfterComplete ? -1 : 0)
   }
 
-  status(): 'idle' | 'ready' | 'starting' | 'unavailable' {
-    return this.state
-  }
+  status(): 'idle' | 'ready' | 'starting' | 'unavailable' { return this.state }
 
   async destroy(): Promise<void> {
     this.destroyed = true
-    if (this.poll) clearInterval(this.poll)
-    this.poll = null
-    for (const [id] of this.sessions) {
-      await this.remove(id)
-    }
-    if (this.client) {
-      await new Promise<void>((resolve) => {
-        try {
-          this.client.destroy(() => resolve())
-        } catch {
-          resolve()
-        }
-      })
-    }
-    this.client = null
-  }
-}
-
-function removeSessionSilently(client: any, torrent: any): void {
-  try {
-    client?.remove(torrent, { destroyStore: false }, () => undefined)
-  } catch {
-    /* ignore */
+    await this.initializing?.catch(() => undefined)
+    await Promise.all([...this.sessions.keys()].map((id) => this.remove(id)))
+    if (this.client) await new Promise<void>((resolve) => this.client.destroy(() => resolve()))
+    this.client = undefined
+    await this.network.close()
   }
 }

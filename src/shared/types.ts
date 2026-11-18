@@ -16,7 +16,7 @@ export type TaskStatus =
   | 'canceled'
 
 export type Language = 'fa' | 'en' | 'ja' | 'ru'
-export type Theme = 'dark' | 'light'
+export type Theme = 'dark' | 'light' | 'system'
 export type CookiesBrowser =
   | ''
   | 'chrome'
@@ -26,6 +26,7 @@ export type CookiesBrowser =
   | 'opera'
   | 'vivaldi'
   | 'chromium'
+  | 'safari'
 
 export interface Settings {
   downloadDir: string
@@ -35,6 +36,7 @@ export interface Settings {
   language: Language
   theme: Theme
   clipboardWatch: boolean
+  keepRunningOnClose: boolean
   notifyOnComplete: boolean
   ytDlpPath: string
   ffmpegPath: string
@@ -49,8 +51,8 @@ export interface Settings {
   cookiesBrowser: CookiesBrowser
   /** Path to an exported cookies.txt file (takes precedence over the browser). */
   cookiesFile: string
-  /** Optional GitHub personal access token used by the repository search. */
-  githubToken: string
+  /** Credential is stored in the macOS Keychain. */
+  githubTokenConfigured: boolean
 }
 
 export interface SegmentState {
@@ -124,6 +126,7 @@ export interface TorrentFileEntry {
 
 export interface TorrentMeta {
   infoHash: string
+  fileIndices?: number[]
   magnet?: string
   torrentFile?: string
   peers: number
@@ -201,6 +204,7 @@ export interface AddDownloadInput {
   url: string
   kind?: 'auto' | 'http' | 'youtube'
   fileName?: string
+  checksum?: string
   dir?: string
   connections?: number
   headers?: Record<string, string>
@@ -296,6 +300,7 @@ export interface AppSnapshot {
   stats: GlobalStats
   system: {
     platform: string
+    arch: string
     version: string
     appVersion: string
     freeDisk: number
@@ -307,31 +312,6 @@ export interface AppSnapshot {
   }
 }
 
-export interface UpdateAsset {
-  name: string
-  url: string
-  size: number
-}
-
-export interface UpdateInfo {
-  current: string
-  latest: string
-  hasUpdate: boolean
-  releaseName: string
-  notes: string
-  publishedAt: string
-  releaseUrl: string
-  asset: UpdateAsset | null
-  canInstall: boolean
-  portable: boolean
-}
-
-export interface UpdateDownloadResult {
-  ok: boolean
-  path?: string
-  error?: string
-}
-
 export interface ResumeWithUrlResult {
   ok: boolean
   /** The new link pointed to a different file, so the download restarted. */
@@ -341,7 +321,6 @@ export interface ResumeWithUrlResult {
 
 export type MainEvent =
   | { type: 'task:update'; task: DownloadTask }
-  | { type: 'update:progress'; received: number; total: number }
   | { type: 'task:remove'; id: string }
   | { type: 'task:add'; task: DownloadTask }
   | { type: 'stats'; stats: GlobalStats }
@@ -349,8 +328,8 @@ export type MainEvent =
   | { type: 'clipboard:url'; url: string }
   | { type: 'clipboard:batch'; urls: string[] }
   | { type: 'open-add'; url?: string }
-  | { type: 'navigate'; view: string }
-  | { type: 'window:state'; maximized: boolean }
+  | { type: 'navigate'; view: 'settings' | 'about' }
+  | { type: 'select-task'; id: string }
   | { type: 'settings'; settings: Settings }
 
 export interface PulseAPI {
@@ -364,10 +343,14 @@ export interface PulseAPI {
   cancelTask(id: string): Promise<void>
   removeTask(id: string, deleteFile: boolean): Promise<void>
   retryTask(id: string): Promise<void>
+  prioritizeTask(id: string): Promise<void>
+  selectTorrentFiles(id: string, indices: number[]): Promise<void>
   revealTask(id: string): Promise<void>
   openTask(id: string): Promise<void>
   clearCompleted(): Promise<void>
   updateSettings(patch: Partial<Settings>): Promise<Settings>
+  setGithubToken(token: string): Promise<void>
+  chooseTool(tool: 'ytDlpPath' | 'ffmpegPath'): Promise<string | null>
   chooseDir(current?: string, title?: string, buttonLabel?: string): Promise<string | null>
   chooseTorrentFile(): Promise<string | null>
   chooseCookiesFile(): Promise<string | null>
@@ -378,13 +361,8 @@ export interface PulseAPI {
   githubRepo(fullName: string): Promise<GithubRepoDetails>
   openExternal(url: string): Promise<void>
   revealDir(dir: string): Promise<void>
-  windowControl(action: 'minimize' | 'maximize' | 'close'): Promise<void>
   readClipboard(): Promise<string>
   writeClipboard(text: string): Promise<void>
-  checkUpdate(): Promise<UpdateInfo>
-  downloadUpdate(info: UpdateInfo): Promise<UpdateDownloadResult>
-  installUpdate(): Promise<void>
-  revealUpdate(): Promise<void>
   resumeWithUrl(id: string, url: string): Promise<ResumeWithUrlResult>
   subscribe(cb: (event: MainEvent) => void): () => void
 }

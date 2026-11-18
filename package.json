@@ -9,12 +9,13 @@
   "scripts": {
     "dev:mac": "electron-vite dev",
     "build:mac": "electron-vite build",
-    "dist:mac:arm64": "npm run build:mac && electron-builder --mac --arm64 --publish never",
+    "dist:mac:arm64": "npm run build:mac && node scripts/dist-mac.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "lint": "eslint src tests && git diff --check",
-    "test": "tsx --test tests/*.test.ts"
+    "test": "tsx --tsconfig tsconfig.node.json --test tests/*.test.ts"
   },
   "dependencies": {
+    "fs-chunk-store": "5.0.1",
     "undici": "7.30.2",
     "webtorrent": "^3.0.21",
     "zod": "4.6.7"
@@ -79,7 +80,7 @@
     ],
     "mac": {
       "icon": "icon.icns",
-      "minimumSystemVersion": "12.0",
+      "minimumSystemVersion": "13.0",
       "artifactName": "Pulse-Mac-${version}-${arch}.${ext}",
       "category": "public.app-category.utilities",
       "hardenedRuntime": true,
@@ -96,7 +97,8 @@
             "arm64"
           ]
         }
-      ]
+      ],
+      "bundleShortVersion": "1.0.20"
     },
     "fileAssociations": [
       {
@@ -104,7 +106,9 @@
         "name": "BitTorrent metainfo",
         "role": "Viewer"
       }
-    ]
+    ],
+    "afterPack": "scripts/prune-native.cjs",
+    "buildVersion": "1.0.20"
   },
   "engines": {
     "node": ">=24 <25"

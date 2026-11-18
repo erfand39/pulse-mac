@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react'
 import { AlertTriangle, ArrowDownToLine, Magnet } from 'lucide-react'
 import { useApp } from './state'
-import { TitleBar } from './components/TitleBar'
 import { Sidebar } from './components/Sidebar'
 import { TopBar } from './components/TopBar'
 import { StatsStrip } from './components/StatsStrip'
@@ -10,7 +9,6 @@ import { DetailPanel } from './components/DetailPanel'
 import { StatusBar } from './components/StatusBar'
 import { AddDownloadModal } from './components/AddDownloadModal'
 import { SettingsModal } from './components/SettingsModal'
-import { UpdateModal } from './components/UpdateModal'
 import { NewLinkModal } from './components/NewLinkModal'
 import { GithubBrowser } from './components/GithubBrowser'
 import { Toasts } from './components/Toasts'
@@ -59,6 +57,10 @@ export function App(): React.JSX.Element {
       setDropping(false)
       const file = e.dataTransfer?.files?.[0]
       if (file && /\.torrent$/i.test(file.name)) {
+        if (file.size > 1024 * 1024) {
+          pushToast('error', t.add.errorTorrent)
+          return
+        }
         try {
           const buffer = await file.arrayBuffer()
           await window.pulse.addTorrent({
@@ -107,7 +109,6 @@ export function App(): React.JSX.Element {
 
   return (
     <div className="app-bg flex h-full flex-col overflow-hidden text-ink">
-      <TitleBar />
       <div className="flex min-h-0 flex-1">
         <Sidebar />
         <main className="flex min-w-0 flex-1 flex-col">
@@ -117,7 +118,7 @@ export function App(): React.JSX.Element {
           ) : (
             <>
               <StatsStrip />
-              <div className="flex min-h-0 flex-1">
+              <div className="relative flex min-h-0 flex-1">
                 <div className="flex min-w-0 flex-1 flex-col">
                   {loadError ? (
                     <div className="scroll-y flex-1 p-5">
@@ -143,7 +144,6 @@ export function App(): React.JSX.Element {
 
       <AddDownloadModal />
       <SettingsModal />
-      <UpdateModal />
       <NewLinkModal />
       <Toasts />
 

@@ -10,8 +10,6 @@ import type {
   PulseAPI,
   ResumeWithUrlResult,
   Settings,
-  UpdateDownloadResult,
-  UpdateInfo,
   YoutubeProbe
 } from '../shared/types'
 import { IP } from '../shared/ipc'
@@ -28,12 +26,16 @@ const api: PulseAPI = {
   cancelTask: (id: string) => ipcRenderer.invoke(IP.cancel, id) as Promise<void>,
   removeTask: (id: string, deleteFile: boolean) =>
     ipcRenderer.invoke(IP.remove, id, deleteFile) as Promise<void>,
+  prioritizeTask: (id: string) => ipcRenderer.invoke(IP.prioritize, id),
+  selectTorrentFiles: (id: string, indices: number[]) => ipcRenderer.invoke(IP.selectTorrentFiles, id, indices),
   retryTask: (id: string) => ipcRenderer.invoke(IP.retry, id) as Promise<void>,
   revealTask: (id: string) => ipcRenderer.invoke(IP.reveal, id) as Promise<void>,
   openTask: (id: string) => ipcRenderer.invoke(IP.open, id) as Promise<void>,
   clearCompleted: () => ipcRenderer.invoke(IP.clearCompleted) as Promise<void>,
   updateSettings: (patch: Partial<Settings>) =>
     ipcRenderer.invoke(IP.updateSettings, patch) as Promise<Settings>,
+  setGithubToken: (token: string) => ipcRenderer.invoke(IP.setGithubToken, token),
+  chooseTool: (tool: 'ytDlpPath' | 'ffmpegPath') => ipcRenderer.invoke(IP.chooseTool, tool),
   chooseDir: (current?: string, title?: string, buttonLabel?: string) =>
     ipcRenderer.invoke(IP.chooseDir, current, title, buttonLabel) as Promise<string | null>,
   chooseTorrentFile: () => ipcRenderer.invoke(IP.chooseTorrent) as Promise<string | null>,
@@ -47,15 +49,8 @@ const api: PulseAPI = {
     ipcRenderer.invoke(IP.githubRepo, fullName) as Promise<GithubRepoDetails>,
   openExternal: (url: string) => ipcRenderer.invoke(IP.openExternal, url) as Promise<void>,
   revealDir: (dir: string) => ipcRenderer.invoke(IP.revealDir, dir) as Promise<void>,
-  windowControl: (action: 'minimize' | 'maximize' | 'close') =>
-    ipcRenderer.invoke(IP.windowControl, action) as Promise<void>,
   readClipboard: () => ipcRenderer.invoke(IP.readClipboard) as Promise<string>,
   writeClipboard: (text: string) => ipcRenderer.invoke(IP.writeClipboard, text) as Promise<void>,
-  checkUpdate: () => ipcRenderer.invoke(IP.checkUpdate) as Promise<UpdateInfo>,
-  downloadUpdate: (info: UpdateInfo) =>
-    ipcRenderer.invoke(IP.downloadUpdate, info) as Promise<UpdateDownloadResult>,
-  installUpdate: () => ipcRenderer.invoke(IP.installUpdate) as Promise<void>,
-  revealUpdate: () => ipcRenderer.invoke(IP.revealUpdate) as Promise<void>,
   resumeWithUrl: (id: string, url: string) =>
     ipcRenderer.invoke(IP.resumeWithUrl, id, url) as Promise<ResumeWithUrlResult>,
   subscribe: (cb: (event: MainEvent) => void) => {
@@ -74,6 +69,13 @@ const pathForFile = (file: File): string => {
     return ''
   }
 }
+
+window.addEventListener('DOMContentLoaded', () => {
+  const report = (): void => { void ipcRenderer.invoke(IP.networkChanged, navigator.onLine).catch(() => undefined) }
+  window.addEventListener('online', report)
+  window.addEventListener('offline', report)
+  report()
+})
 
 contextBridge.exposeInMainWorld('pulse', api)
 contextBridge.exposeInMainWorld('pulsePath', { pathForFile })
