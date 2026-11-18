@@ -17,7 +17,7 @@
   },
   "dependencies": {
     "fs-chunk-store": "5.0.1",
-    "undici": "7.30.2",
+    "undici": "8.12.4",
     "webtorrent": "^3.0.21",
     "zod": "4.6.7"
   },
