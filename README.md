@@ -94,7 +94,7 @@ npm ci
 npm run dist:mac:arm64
 ```
 
-بسته‌ها در `dist/` قرار می‌گیرند. نسخهٔ محلی برنامه را می‌توان با `open "dist/mac-arm64/Pulse Mac.app"` باز کرد. در زمان انتشار سورس، باندل متقاطع ARM64 از لینوکس بررسی معماری شده و اجرای بسته روی M1 در گزارش آزمون هنوز تأیید نشده است. [راهنمای فارسی نصب، امضا و بازیابی](README_MAC_FA.md)
+بسته‌ها در `dist/` قرار می‌گیرند. نسخهٔ محلی برنامه را می‌توان با `open "dist/mac-arm64/Pulse Mac.app"` باز کرد. ساخت DMG و ZIP، بررسی امضای محلی و آزمون اولیهٔ اجرای برنامه روی runner مک ARM64 موفق بود. [دریافت فایل‌های ساخت و مشاهدهٔ نتیجه](https://github.com/erfand39/pulse-mac/actions/runs/44389499919) · [راهنمای فارسی نصب، امضا و بازیابی](README_MAC_FA.md)
 
 برای توسعه:
 
@@ -122,7 +122,7 @@ npm run bench:http
 
 Pulse Mac is an Apple Silicon download manager with a Persian RTL interface. It queues direct HTTP, yt-dlp, public BitTorrent and GitHub downloads. Its HTTP engine schedules pieces across up to 16 connections, respects server backoff and stores progress for recovery after interruption. Optional SHA-256 verification checks the final file.
 
-On a local 32 MiB benchmark, eight HTTP connections were **7.5× faster** than one under a per-connection bandwidth cap. With slow and fast pieces in the same download, the new scheduler was **3.2× faster** than the previous scheduler using eight connections in both cases. The [test report](docs/MAC_TEST_REPORT.md) records the setup and macOS verification status.
+On a local 32 MiB benchmark, eight HTTP connections were **7.5× faster** than one under a per-connection bandwidth cap. With slow and fast pieces in the same download, the new scheduler was **3.2× faster** than the previous scheduler using eight connections in both cases. The [test report](docs/MAC_TEST_REPORT.md) records the benchmark setup. The [macOS ARM64 workflow](https://github.com/erfand39/pulse-mac/actions/runs/44389499919) built the DMG and ZIP, verified the bundle and passed a launch smoke test.
 
 Build on Apple Silicon with macOS 13+ and Node.js 24.22.1 by running `npm ci && npm run dist:mac:arm64`.
 
