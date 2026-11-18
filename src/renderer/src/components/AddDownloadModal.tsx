@@ -151,7 +151,6 @@ export function AddDownloadModal(): React.JSX.Element {
     setSelectedFormat('best')
     if (initialUrl && nextTab === 'link') void analyzeLink(initialUrl)
     if (initialUrl && nextTab === 'video') void analyzeVideo(initialUrl)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [addOpen])
 
   const analyzeLink = async (raw?: string): Promise<void> => {

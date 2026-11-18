@@ -1,0 +1,7 @@
+Pulse Mac is a modified fork of Pulse Download Manager by TheGreatAzizi.
+Upstream https://github.com/TheGreatAzizi/Pulse-Download-Manager
+Base tag v1.0.20, commit 2b03c06ffe0a35f0e84f1f740fc149e5ec747363.
+The original name and icon are credited to the upstream project.
+This fork changes Apple Silicon packaging, macOS integration, local storage,
+download reliability and security. See the Git history for dates and changes.
+Licensed under GPL-3.0-or-later. See LICENSE and the corresponding source tree.

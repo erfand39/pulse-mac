@@ -1,22 +1,23 @@
 {
-  "name": "pulse-download-manager",
-  "version": "1.0.20",
-  "description": "Pulse is a cross-platform download manager for direct links, YouTube videos and torrents.",
+  "name": "pulse-mac",
+  "version": "1.0.20-mac.1",
+  "description": "Local download manager for Apple Silicon Macs",
   "main": "./out/main/index.js",
   "author": "TheGreatAzizi",
   "license": "GPL-3.0-or-later",
   "private": true,
   "scripts": {
-    "dev": "electron-vite dev",
-    "start": "electron-vite preview",
-    "build": "electron-vite build",
+    "dev:mac": "electron-vite dev",
+    "build:mac": "electron-vite build",
+    "dist:mac:arm64": "npm run build:mac && electron-builder --mac --arm64 --publish never",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
-    "dist": "electron-vite build && electron-builder",
-    "dist:win": "electron-vite build && electron-builder --win",
-    "dist:linux": "electron-vite build && electron-builder --linux"
+    "lint": "eslint src tests && git diff --check",
+    "test": "tsx --test tests/*.test.ts"
   },
   "dependencies": {
-    "webtorrent": "^3.0.21"
+    "undici": "7.30.2",
+    "webtorrent": "^3.0.21",
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.5",
@@ -27,24 +28,33 @@
     "electron": "^45.3.1",
     "electron-builder": "^26.18.0",
     "electron-vite": "^6.0.0",
+    "eslint": "9.39.5",
     "lucide-react": "^1.72.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "tailwindcss": "^4.3.5",
+    "tsx": "4.23.15",
     "typescript": "^5.9.3",
+    "typescript-eslint": "8.73.0",
     "vite": "^8.3.8"
   },
   "build": {
-    "appId": "com.pulse.downloadmanager.app",
-    "productName": "Pulse",
+    "appId": "local.pulse.personal.mac",
+    "productName": "Pulse Mac",
     "npmRebuild": false,
+    "asar": true,
+    "asarUnpack": [
+      "**/*.node",
+      "**/prebuilds/**"
+    ],
     "directories": {
       "output": "dist",
       "buildResources": "resources"
     },
     "files": [
       "out/**/*",
-      "resources/**/*"
+      "LICENSE",
+      "NOTICE"
     ],
     "extraResources": [
       {
@@ -55,60 +65,48 @@
         ]
       },
       {
-        "from": "LICENSE",
-        "to": "LICENSE"
-      },
-      {
         "from": "resources/icon.png",
         "to": "icon.png"
       },
       {
-        "from": "resources/icon.ico",
-        "to": "icon.ico"
+        "from": "resources/menubarTemplate.png",
+        "to": "menubarTemplate.png"
+      },
+      {
+        "from": "resources/menubarTemplate@2x.png",
+        "to": "menubarTemplate@2x.png"
       }
     ],
-    "win": {
-      "icon": "icon.ico",
+    "mac": {
+      "icon": "icon.icns",
+      "minimumSystemVersion": "12.0",
+      "artifactName": "Pulse-Mac-${version}-${arch}.${ext}",
+      "category": "public.app-category.utilities",
+      "hardenedRuntime": true,
       "target": [
         {
-          "target": "nsis",
+          "target": "dmg",
           "arch": [
-            "x64"
+            "arm64"
           ]
         },
         {
-          "target": "portable",
+          "target": "zip",
           "arch": [
-            "x64"
+            "arm64"
           ]
         }
       ]
     },
-    "nsis": {
-      "oneClick": false,
-      "perMachine": false,
-      "allowElevation": true,
-      "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true,
-      "runAfterFinish": true,
-      "deleteAppDataOnUninstall": false,
-      "shortcutName": "Pulse",
-      "artifactName": "Pulse-Setup-${version}-${arch}.${ext}",
-      "include": "installer.nsh"
-    },
-    "portable": {
-      "artifactName": "Pulse-Portable-${version}-${arch}.${ext}"
-    },
-    "linux": {
-      "icon": "icon.png",
-      "target": [
-        "AppImage",
-        "deb"
-      ],
-      "category": "Network",
-      "artifactName": "Pulse-${version}-${arch}.${ext}",
-      "maintainer": "Pulse"
-    }
+    "fileAssociations": [
+      {
+        "ext": "torrent",
+        "name": "BitTorrent metainfo",
+        "role": "Viewer"
+      }
+    ]
+  },
+  "engines": {
+    "node": ">=24 <25"
   }
 }

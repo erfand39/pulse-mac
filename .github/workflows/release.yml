@@ -1,114 +1,37 @@
-name: Release
+name: Pulse Mac ARM64
 
 on:
+  workflow_dispatch:
   push:
-    tags:
-      - 'v*'
+    branches: [mac-personal]
+  pull_request:
+
+permissions:
+  contents: read
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
+  mac-arm64:
+    runs-on: macos-15
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Install Electron binary
-        run: node node_modules/electron/install.js
-
-      - name: Build app
-        run: |
-          npm run typecheck
-          npm run build
-
-      - name: Package for Windows
-        run: npx electron-builder --win --publish never
-
-      - name: Verify Windows installer
-        shell: pwsh
-        run: |
-          $setup = Get-ChildItem dist -Filter 'Pulse-Setup-*.exe' -ErrorAction SilentlyContinue
-          if (-not $setup) { throw 'NSIS installer was not generated' }
-          $setup | Select-Object Name, Length | Format-Table
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: pulse-win
-          path: |
-            dist/Pulse-Setup-*.exe
-            dist/Pulse-Setup-*.exe.blockmap
-            dist/Pulse-Portable-*.exe
-          if-no-files-found: error
-
-  build-linux:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Install Electron binary
-        run: node node_modules/electron/install.js
-
-      - name: Build app
-        run: |
-          npm run typecheck
-          npm run build
-
-      - name: Package for Linux
-        run: npx electron-builder --linux --publish never
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: pulse-linux
-          path: |
-            dist/Pulse-*.AppImage
-            dist/Pulse-*.deb
-          if-no-files-found: error
-
-  release:
-    needs: [build-windows, build-linux]
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download Windows artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: pulse-win
-          path: artifacts/win
-
-      - name: Download Linux artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: pulse-linux
-          path: artifacts/linux
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            artifacts/win/*
-            artifacts/linux/*
-          generate_release_notes: true
+          node-version-file: .nvmrc
+          cache: npm
+      - run: test "$(uname -m)" = arm64
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run dist:mac:arm64
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - run: bash scripts/verify-mac.sh
+      - run: env PULSE_PACKAGE_SMOKE=1 "dist/mac-arm64/Pulse Mac.app/Contents/MacOS/Pulse Mac"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pulse-mac-arm64
+          path: |
+            dist/Pulse-Mac-*-arm64.dmg
+            dist/Pulse-Mac-*-arm64.zip
+          if-no-files-found: error

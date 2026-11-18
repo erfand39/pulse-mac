@@ -86,7 +86,6 @@ export function GithubBrowser(): React.JSX.Element {
 
   useEffect(() => {
     void runSearch(POPULAR_QUERY, true)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const loadMore = async (): Promise<void> => {
