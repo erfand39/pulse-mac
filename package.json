@@ -104,7 +104,8 @@
       {
         "ext": "torrent",
         "name": "BitTorrent metainfo",
-        "role": "Viewer"
+        "role": "Viewer",
+        "rank": "Alternate"
       }
     ],
     "afterPack": "scripts/prune-native.cjs",

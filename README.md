@@ -1,5 +1,7 @@
 # Pulse Download Manager
 
+> **Pulse Mac fork:** See [the macOS build and usage guide](README_MAC_FA.md) for the Apple Silicon release. The upstream project description follows.
+
 A cross-platform download manager for direct links, YouTube videos, and BitTorrent. Built with Electron, React and TypeScript.
 
 [![GitHub](https://img.shields.io/badge/GitHub-TheGreatAzizi%2FPulse--Download--Manager-181717?logo=github)](https://github.com/TheGreatAzizi/Pulse-Download-Manager)

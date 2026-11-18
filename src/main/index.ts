@@ -2,6 +2,7 @@ import {
   app, BrowserWindow, Menu, clipboard, dialog, nativeTheme, Tray, nativeImage,
   powerMonitor, session
 } from 'electron'
+import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { Store } from './store'
@@ -26,7 +27,9 @@ const pendingTorrents: string[] = []
 
 app.setName('Pulse Mac')
 const smoke = app.isPackaged && process.env.PULSE_PACKAGE_SMOKE === '1'
-app.setPath('userData', join(app.getPath('appData'), smoke ? 'pulse-mac-smoke' : 'pulse-mac'))
+const profileDir = join(app.getPath('appData'), smoke ? 'pulse-mac-smoke' : 'pulse-mac')
+mkdirSync(profileDir, { recursive: true, mode: 0o700 })
+app.setPath('userData', profileDir)
 const gotLock = app.requestSingleInstanceLock()
 
 const rendererPath = join(__dirname, '../renderer/index.html')
@@ -184,7 +187,7 @@ async function bootstrap(): Promise<void> {
   session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false))
   session.defaultSession.setPermissionCheckHandler(() => false)
   store = new Store()
-  await store.load()
+  await store.load(!smoke)
   nativeTheme.themeSource = store.settings.theme
   manager = new DownloadManager({
     store,

@@ -93,7 +93,7 @@ function strongEtag(value: string | null): string | undefined {
 }
 
 function buildSegments(size: number, connections: number): SegmentState[] {
-  const count = Math.max(1, Math.min(connections, Math.ceil(size / 1_048_576)))
+  const count = Math.max(1, Math.min(16, connections, Math.ceil(size / 1_048_576)))
   const chunk = Math.floor(size / count)
   return Array.from({ length: count }, (_, i) => ({
     start: i * chunk, end: i === count - 1 ? size : (i + 1) * chunk, position: i * chunk

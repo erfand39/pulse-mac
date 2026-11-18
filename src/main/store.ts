@@ -98,9 +98,9 @@ export class Store {
   warning = ''
   onSaveError?: () => void
 
-  async load(): Promise<void> {
+  async load(migrateLegacy = true): Promise<void> {
     await fs.mkdir(app.getPath('userData'), { recursive: true, mode: 0o700 })
-    const loaded = await this.state.load(join(app.getPath('appData'), 'pulse-download-manager', 'pulse-state.json'))
+    const loaded = await this.state.load(migrateLegacy ? join(app.getPath('appData'), 'pulse-download-manager', 'pulse-state.json') : undefined)
     if (loaded.data) this.data = loaded.data
     for (const task of this.data.tasks) {
       const ciphertext = this.data.protectedUrls?.get(task.id)
