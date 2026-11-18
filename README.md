@@ -1,142 +1,131 @@
-# Pulse Download Manager
+<div align="center">
 
-> **Pulse Mac fork:** See [the macOS build and usage guide](README_MAC_FA.md) for the Apple Silicon release. The upstream project description follows.
+<img src="docs/assets/pulse-mac-banner.webp" alt="Pulse Mac، دانلود منیجر فارسی برای مک‌های Apple Silicon" width="100%" />
 
-A cross-platform download manager for direct links, YouTube videos, and BitTorrent. Built with Electron, React and TypeScript.
+<h1>پالس مک | Pulse Mac</h1>
+<p><strong>دانلودهای بزرگ را چنداتصالی بگیر و بعد از قطع اینترنت از همان‌جا ادامه بده.</strong></p>
 
-[![GitHub](https://img.shields.io/badge/GitHub-TheGreatAzizi%2FPulse--Download--Manager-181717?logo=github)](https://github.com/TheGreatAzizi/Pulse-Download-Manager)
-[![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](https://github.com/TheGreatAzizi/Pulse-Download-Manager/blob/main/LICENSE)
+<p>
+  <a href="#preview">نمای برنامه</a> ·
+  <a href="#features">قابلیت‌ها</a> ·
+  <a href="#performance">آزمون سرعت</a> ·
+  <a href="#quick-start">شروع سریع</a> ·
+  <a href="#guides">راهنماها</a> ·
+  <a href="#english">English</a>
+</p>
 
-## Downloads
+<p>
+  <img src="https://img.shields.io/badge/Pulse%20Mac-1.0.20--mac.2-6B65D8?style=flat-square" alt="نسخهٔ 1.0.20-mac.2" />
+  <img src="https://img.shields.io/badge/macOS-13%2B%20%7C%20ARM64-192239?style=flat-square&amp;logo=apple&amp;logoColor=white" alt="macOS 13 و بالاتر، Apple Silicon" />
+  <img src="https://img.shields.io/badge/Interface-Persian%20%7C%20RTL-415AA8?style=flat-square" alt="رابط فارسی و راست‌چین" />
+  <img src="https://img.shields.io/badge/Electron-React%20%7C%20TypeScript-1C5790?style=flat-square&amp;logo=electron&amp;logoColor=white" alt="Electron، React و TypeScript" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0--or--later-34544E?style=flat-square" alt="مجوز GPL-3.0-or-later" /></a>
+</p>
 
-Get the latest releases from the [Releases page](https://github.com/TheGreatAzizi/Pulse-Download-Manager/releases).
+</div>
 
-**Windows**
-- `Pulse-Setup-*.exe`: NSIS installer with optional auto-start, desktop and Start Menu shortcuts
-- `Pulse-Portable-*.exe`: portable build, no installation required
+---
 
-**Linux**
-- `Pulse-*.AppImage`: runs on most distributions including Arch
-- `Pulse-*.deb`: Debian/Ubuntu package
+**Pulse Mac** یک دانلود منیجر محلی برای مک‌های Apple Silicon است. لینک مستقیم، ویدئو، تورنت و فایل‌های GitHub را در یک صف مدیریت کن. رابط فارسی و راست‌چین، منوی بومی مک، و ذخیرهٔ پیشرفت دانلود در کنار فایل موقت، پیگیری و بازیابی دانلودها را ساده‌تر می‌کند.
 
-> Arch / similar distros: install `fuse2` for AppImage support `sudo pacman -S fuse2`. If FUSE is unavailable, run `./Pulse-*.AppImage --appimage-extract-and-run`. `.deb` can be converted with `debtap`.
+<a id="preview"></a>
+## یک نگاه به Pulse Mac
 
-### Installation and Auto-start
+<div align="center">
+  <img src="docs/assets/pulse-mac-preview.webp" alt="نمای تیرهٔ رابط فارسی Pulse Mac با صف دانلود، سرعت و پیشرفت قطعه‌ها" width="100%" />
+  <p><sub>نمای رابط همین پروژه در Chromium با دادهٔ نمونه.</sub></p>
+</div>
 
-The Windows installer allows choosing the install directory, creates desktop and Start Menu shortcuts, and registers Pulse in Programs and Features. After install, Pulse launches at system start by default. Toggle this in **Settings → General → Launch Pulse when the system starts**. Portable builds do not enable auto-start.
+<a id="features"></a>
+## قابلیت‌ها
 
-## Screenshots
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>⚡ دانلود چنداتصالی</h3>
+      <p>تا ۱۶ اتصال برای لینک مستقیم سازگار با Range. هر اتصال آزاد قطعهٔ بعدی را می‌گیرد. با سیگنال محدودیت سرور، تعداد درخواست‌های هم‌زمان پایین می‌آید.</p>
+    </td>
+    <td width="50%" valign="top">
+      <h3>↻ ادامه و بررسی فایل</h3>
+      <p>پیشرفت دانلود روی دیسک ثبت می‌شود تا بعد از قطع اتصال یا بسته‌شدن برنامه بازیابی شود. با وارد کردن SHA‑256 می‌توان فایل نهایی را بررسی کرد.</p>
+    </td>
+  </tr>
+  <tr>
+    <td valign="top">
+      <h3>🎬 ویدئو و تورنت</h3>
+      <p>انتخاب کیفیت و دریافت ویدئو با yt-dlp، ادغام و استخراج صدا در صورت نصب FFmpeg، و دریافت Magnet یا فایل تورنت از طریق DHT عمومی.</p>
+    </td>
+    <td valign="top">
+      <h3>📥 صف و دانلود گروهی</h3>
+      <p>چند لینک را یک‌جا وارد کن، وظیفه‌ها را توقف و ادامه بده، یا فایل‌های انتشار و آرشیوهای GitHub را از داخل برنامه به صف اضافه کن.</p>
+    </td>
+  </tr>
+  <tr>
+    <td valign="top">
+      <h3>🍎 یکپارچگی با macOS</h3>
+      <p>منوی بومی، کنترل صف در نوار منو، اعلان پایان دانلود، باز کردن فایل تورنت از Finder و اجرای اختیاری هنگام ورود.</p>
+    </td>
+    <td valign="top">
+      <h3>🔐 داده‌های محلی</h3>
+      <p>ذخیرهٔ اتمیک تنظیمات و پیشرفت، نسخهٔ پشتیبان از وضعیت برنامه و محافظت از توکن اختیاری GitHub با Keychain.</p>
+    </td>
+  </tr>
+</table>
 
-### Main Dashboard
-![Main Dashboard](https://raw.githubusercontent.com/TheGreatAzizi/Pulse-Download-Manager/main/docs/screenshots/final/main-light.png)
+<a id="performance"></a>
+## سرعت در آزمون کنترل‌شده
 
-### Dark Theme
-![Dark Theme](https://raw.githubusercontent.com/TheGreatAzizi/Pulse-Download-Manager/main/docs/screenshots/final/main-dark.png)
+| شرایط سرور محلی | مبنا | Pulse Mac | نتیجه |
+| --- | ---: | ---: | ---: |
+| سقف سرعت جداگانه برای هر اتصال | ۴٫۱۰۷ ثانیه با یک اتصال | ۰٫۵۴۹ ثانیه با هشت اتصال | **۷٫۵ برابر** |
+| سرعت نابرابر قطعه‌ها | ۲٫۱۷۵ ثانیه در نسخهٔ قبلی | ۰٫۶۷۲ ثانیه با زمان‌بندی جدید | **۳٫۲ برابر** |
 
-### Persian RTL
-![Persian RTL](https://raw.githubusercontent.com/TheGreatAzizi/Pulse-Download-Manager/main/docs/screenshots/final/main-fa.png)
+هر عدد میانهٔ سه دانلود فایل ۳۲ MiB با تطبیق SHA‑256 است. ردیف دوم در هر دو نسخه با هشت اتصال اندازه‌گیری شد. سرعت روی اینترنت به پهنای باند، شیوهٔ محدودیت سرور و پشتیبانی از Range بستگی دارد. [شرایط و روش بازتولید](docs/MAC_TEST_REPORT.md#سنجش-سرعت-http)
 
-### Settings
-![Settings](https://raw.githubusercontent.com/TheGreatAzizi/Pulse-Download-Manager/main/docs/screenshots/final/settings-general-light.png)
+<a id="quick-start"></a>
+## شروع سریع روی مک
 
-### Add Download
-![Add Download](https://raw.githubusercontent.com/TheGreatAzizi/Pulse-Download-Manager/main/docs/screenshots/final/add-download-en.png)
-
-### GitHub Browser
-![GitHub Browser](https://raw.githubusercontent.com/TheGreatAzizi/Pulse-Download-Manager/main/docs/screenshots/final/github-browser.png)
-
-### Empty State
-![Empty State](https://raw.githubusercontent.com/TheGreatAzizi/Pulse-Download-Manager/main/docs/screenshots/final/empty-paused.png)
-
-### About
-![About](https://raw.githubusercontent.com/TheGreatAzizi/Pulse-Download-Manager/main/docs/screenshots/final/settings-about-light.png)
-
-### Software update
-![Software update](https://raw.githubusercontent.com/TheGreatAzizi/Pulse-Download-Manager/main/docs/screenshots/final/update-available.png)
-
-### Resume with a new link
-![Resume with a new link](https://raw.githubusercontent.com/TheGreatAzizi/Pulse-Download-Manager/main/docs/screenshots/final/resume-new-link.png)
-
-## Features
-
-- **Multi-connection HTTP downloads**: Range requests, resume on disconnect, smart queue, speed limit
-- **Expired link recovery**: paste a fresh link for the same file and continue from the saved byte position
-- **Batch downloads**: paste or detect a list of direct HTTP/HTTPS links and queue them in one step, with validation, dedupe and progress
-- **YouTube & 1000+ sites** via `yt-dlp`: quality selection, audio extraction, subtitles, thumbnails, playlists
-- **BitTorrent**: magnet and .torrent files, file selection, secure resume, peer/seeder stats, upload ratio
-- **GitHub browser**: search public repositories, download source ZIPs, release assets and archives. Optional GitHub token raises API limits
-- **Multilingual UI**: English, Persian RTL, Japanese, Russian; Light/Dark theme
-- **Built-in tools**: automatic `yt-dlp` installer, `ffmpeg` detection, torrent engine management
-- **Auto-start**: optional launch on Windows login and Linux autostart
-- **Clipboard monitor**: suggests adding copied links, and detects multi-link lists for batch download
-- **In-app updates**: checks GitHub Releases on startup and from **Settings → About**, then downloads and launches the new installer with progress
-
-## GitHub Integration
-
-Open **GitHub** in the sidebar to search public repositories, download ZIP archives of default branches or tags, and fetch release assets directly into the download queue. Add a personal access token in **Settings → Tools → GitHub token** to increase API rate limits from 60 to 5,000 requests/hour.
-
-## Development
+نیازمندی ساخت **macOS 13 یا جدیدتر، Apple Silicon و Node.js 24.22.1 برای ARM64** است. برای ساخت از سورس:
 
 ```bash
-npm install
-npm run dev        # development mode
-npm run typecheck  # type check
-npm run build      # production build
-npm start          # run built app
+git clone https://github.com/erfand39/pulse-mac.git
+cd pulse-mac
+npm ci
+npm run dist:mac:arm64
 ```
 
-Build distributions:
+بسته‌ها در `dist/` قرار می‌گیرند. نسخهٔ محلی برنامه را می‌توان با `open "dist/mac-arm64/Pulse Mac.app"` باز کرد. در زمان انتشار سورس، باندل متقاطع ARM64 از لینوکس بررسی معماری شده و اجرای بسته روی M1 در گزارش آزمون هنوز تأیید نشده است. [راهنمای فارسی نصب، امضا و بازیابی](README_MAC_FA.md)
+
+برای توسعه:
 
 ```bash
-npm run dist:win   # Windows NSIS + Portable
-npm run dist:linux # AppImage + deb
+npm run dev:mac
+npm run typecheck
+npm run lint
+npm test
+npm run bench:http
 ```
 
-Output is written to `dist/`.
+<a id="guides"></a>
+## راهنماها
 
-Optional binaries can be placed in `resources/bin/` (`yt-dlp` and `ffmpeg`) to be bundled with the app. Otherwise Pulse discovers them from system paths or user data.
+| موضوع | راهنما |
+| --- | --- |
+| نصب، دانلود، FFmpeg و بازیابی | [راهنمای فارسی](README_MAC_FA.md) |
+| صف، چک‌پوینت، زمان‌بندی HTTP و ذخیره‌سازی | [معماری](docs/MAC_ARCHITECTURE.md) |
+| آزمون‌ها، سرعت و وضعیت اجرای Mac | [گزارش آزمون](docs/MAC_TEST_REPORT.md) |
+| Keychain، محدودیت‌ها و امضای بسته | [یادداشت‌های امنیتی](docs/SECURITY_NOTES.md) |
+| ساخت و بررسی بسته روی runner مک | [GitHub Actions](.github/workflows/release.yml) |
 
-## YouTube bot detection
+<a id="english"></a>
+## English
 
-If YouTube returns “Sign in to confirm you’re not a bot”:
+Pulse Mac is an Apple Silicon download manager with a Persian RTL interface. It queues direct HTTP, yt-dlp, public BitTorrent and GitHub downloads. Its HTTP engine schedules pieces across up to 16 connections, respects server backoff and stores progress for recovery after interruption. Optional SHA-256 verification checks the final file.
 
-1. Update `yt-dlp` in **Settings → Tools**
-2. Provide authentication:
-   - Browser cookies: choose a logged-in browser
-   - Cookies file: load a `cookies.txt` exported with an extension such as “Get cookies.txt LOCALLY”
-3. Re-analyze the link
+On a local 32 MiB benchmark, eight HTTP connections were **7.5× faster** than one under a per-connection bandwidth cap. With slow and fast pieces in the same download, the new scheduler was **3.2× faster** than the previous scheduler using eight connections in both cases. The [test report](docs/MAC_TEST_REPORT.md) records the setup and macOS verification status.
 
-Keep `yt-dlp` newer than 2025.11 for JavaScript runtime support.
+Build on Apple Silicon with macOS 13+ and Node.js 24.22.1 by running `npm ci && npm run dist:mac:arm64`.
 
-## Project Structure
+## منبع و مجوز · Credits
 
-```
-src/
-  main/       Electron main process: HTTP, YouTube, torrent engines, queue, persistence
-  preload/    Secure window.pulse bridge
-  renderer/   React + Tailwind UI
-  shared/     Types and IPC contracts
-resources/bin/  Optional bundled binaries
-```
-
-- State is persisted in `userData/pulse-state.json`
-- Unfinished HTTP downloads use `.pulse-part` and `.pulse-meta` sidecars
-- Global speed limit is configurable in **Settings → Speed** or the status bar
-
-## Credits
-
-Batch download support was inspired by [@mamfan](https://github.com/mamfan) and the original [pull request #8](https://github.com/TheGreatAzizi/Pulse-Download-Manager/pull/8). Thank you for the idea and the groundwork.
-
-## Contributing
-
-Repository: [github.com/TheGreatAzizi/Pulse-Download-Manager](https://github.com/TheGreatAzizi/Pulse-Download-Manager)
-
-Report bugs and request features via [Issues](https://github.com/TheGreatAzizi/Pulse-Download-Manager/issues). Pull requests are welcome.
-
-## License
-
-GNU General Public License v3.0 or later
-
-Copyright (C) 2026 TheGreatAzizi
-
-See [LICENSE](LICENSE) for full text. Pulse is free software; you may redistribute and modify it under GPL-3.0 terms.
+Pulse Mac فورک مک پروژهٔ Pulse Download Manager از TheGreatAzizi، بر پایهٔ `v1.0.20` است. مجوز **GPL-3.0-or-later** و انتساب آیکون و سورس حفظ شده‌اند. [پروژهٔ اصلی](https://github.com/TheGreatAzizi/Pulse-Download-Manager) · [NOTICE](NOTICE) · [LICENSE](LICENSE)
