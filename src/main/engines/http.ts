@@ -35,24 +35,41 @@ export interface ProbeOutput {
   headers: Record<string, string>
 }
 
+const MAX_CONNECTIONS = 16
+const MAX_SEGMENTS = 512
+const MIB = 1024 * 1024
+const MAX_RANGE_ATTEMPTS = 5
 const position = z.number().int().nonnegative()
 const leaf = z.string().min(1).refine((value) => value !== '.' && value !== '..' && !/[/\\\0]/.test(value))
 const identityShape = z.object({ dev: position, ino: position })
 const checkpointShape = z.object({
   source: z.string().regex(/^[a-f0-9]{64}$/),
   validator: z.string().optional(),
+  expectedChecksum: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   destination: z.string().optional(),
   modified: z.string().optional(),
   size: position,
   part: z.uuid(),
   identity: identityShape,
-  segments: z.array(z.object({ start: position, end: position, position })).max(16),
+  segments: z.array(z.object({ start: position, end: position, position })).max(MAX_SEGMENTS),
   publication: z.object({ name: leaf, size: position }).optional()
 })
 type Checkpoint = z.infer<typeof checkpointShape>
 
 class HttpError extends Error {
-  constructor(readonly status: number) { super(`HTTP ${status}`) }
+  constructor(readonly status: number, readonly retryDelay = 0) { super(`HTTP ${status}`) }
+
+  get congested(): boolean { return this.status === 429 || this.status === 503 }
+  get retryable(): boolean { return this.status === 408 || this.congested || this.status >= 500 }
+
+  static from(response: Response): HttpError {
+    const header = response.headers.get('retry-after')?.trim()
+    let delay = 0
+    if (header) {
+      delay = /^\d+$/.test(header) ? Number(header) * 1000 : Date.parse(header) - Date.now()
+    }
+    return new HttpError(response.status, Number.isFinite(delay) ? Math.max(0, delay) : 0)
+  }
 }
 
 class RangeRejected extends Error {
@@ -93,7 +110,10 @@ function strongEtag(value: string | null): string | undefined {
 }
 
 function buildSegments(size: number, connections: number): SegmentState[] {
-  const count = Math.max(1, Math.min(16, connections, Math.ceil(size / 1_048_576)))
+  // Smaller pieces let an available connection take more work while a slow
+  // request is still in progress. Keep one contiguous piece in single mode.
+  const targets = connections === 1 ? 1 : Math.max(connections * 4, Math.ceil(size / (16 * MIB)))
+  const count = Math.max(1, Math.min(MAX_SEGMENTS, targets, Math.ceil(size / MIB)))
   const chunk = Math.floor(size / count)
   return Array.from({ length: count }, (_, i) => ({
     start: i * chunk, end: i === count - 1 ? size : (i + 1) * chunk, position: i * chunk
@@ -166,7 +186,7 @@ export class HttpEngine {
         range = undefined
       }
       try {
-        if (res.status !== 200 && !(res.status === 206 && range)) throw new HttpError(res.status)
+        if (res.status !== 200 && !(res.status === 206 && range)) throw HttpError.from(res)
         const size = range?.size ?? (identity(res) ? contentLength(res) ?? 0 : 0)
         const contentType = res.headers.get('content-type') ?? undefined
         const fileName = parseContentDisposition(res.headers.get('content-disposition')) || guessNameFromUrl(res.url || url)
@@ -259,13 +279,16 @@ export class HttpEngine {
 
     const probe = await this.probe(task.url, task.headers, undefined, signal)
     signal.throwIfAborted()
-    let ranged = probe.resumable && !!probe.etag && probe.size > 0
+    const checksum = task.checksum?.toLowerCase()
+    let ranged = probe.resumable && Boolean(probe.etag || checksum) && probe.size > 0
+    const ceiling = Math.min(MAX_CONNECTIONS, Math.max(1, task.maxConnections || this.host.settings().connections))
     const fileName = sanitizeFileName(task.fileName === guessNameFromUrl(task.url) || !task.fileName ? probe.fileName : task.fileName)
     let checkpoint = previous
     for (let attempt = 0; attempt < 2; attempt++) {
       const source = digest(task.url)
       const resumed = ranged && checkpoint && checkpoint.source === source &&
-        checkpoint.validator === probe.etag && checkpoint.destination === digest(probe.finalUrl) && checkpoint.size === probe.size &&
+        checkpoint.validator === probe.etag && (probe.etag || checkpoint.expectedChecksum === checksum) &&
+        checkpoint.destination === digest(probe.finalUrl) && checkpoint.size === probe.size &&
         validSegments(checkpoint.segments, probe.size) && !checkpoint.publication &&
         ownedFile(await exists(fileFor(checkpoint, stage)), checkpoint)
       let file: FileHandle
@@ -282,8 +305,9 @@ export class HttpEngine {
         const stat = await file.stat()
         checkpoint = {
           source, part, size: probe.size, identity: { dev: stat.dev, ino: stat.ino },
-          validator: probe.etag, modified: probe.lastModified, destination: digest(probe.finalUrl),
-          segments: ranged ? buildSegments(probe.size, task.maxConnections || this.host.settings().connections) : []
+          validator: probe.etag, expectedChecksum: probe.etag ? undefined : checksum,
+          modified: probe.lastModified, destination: digest(probe.finalUrl),
+          segments: ranged ? buildSegments(probe.size, ceiling) : []
         }
       }
       const state = checkpoint!
@@ -325,22 +349,12 @@ export class HttpEngine {
         await save()
         handle.patch({
           status: 'downloading', size: probe.size, downloaded, fileName,
-          connections: ranged ? state.segments.filter((s) => s.position < s.end).length : 1,
+          connections: ranged ? 0 : 1,
           resumable: ranged, filePath: undefined, linkExpired: false
         })
         if (ranged) {
-          let firstError: unknown
-          const workers = state.segments.map(async (segment) => {
-            try {
-              await this.downloadRange(handle, file, segment, state, active, tick)
-            } catch (error) {
-              if (!firstError) firstError = error
-              controller.abort(error)
-            }
-          })
-          await Promise.all(workers)
+          await this.downloadRanges(handle, file, state, ceiling, controller, active, tick)
           if (saveError) throw saveError
-          if (firstError) throw firstError
         } else {
           downloaded = await this.readResponse(handle, active, this.headers(task.url, task.headers),
             undefined, async (value, offset) => {
@@ -357,6 +371,7 @@ export class HttpEngine {
       } catch (error) {
         await writes
         if (ranged && !saveError) await save()
+        handle.patch({ downloaded, segments: state.segments.map((segment) => ({ ...segment })) })
         if (!signal.aborted && ranged && error instanceof RangeRejected) retryWithoutRange = true
         else throw saveError || error
       } finally {
@@ -369,7 +384,10 @@ export class HttpEngine {
         continue
       }
 
-      handle.patch({ status: 'verifying', connections: 0 })
+      handle.patch({
+        status: 'verifying', connections: 0, downloaded,
+        segments: state.segments.map((segment) => ({ ...segment }))
+      })
       const part = fileFor(state, stage)
       await this.verify(handle, part)
       signal.throwIfAborted()
@@ -378,36 +396,115 @@ export class HttpEngine {
     }
   }
 
+  private async downloadRanges(
+    handle: TaskHandle, file: FileHandle, state: Checkpoint, ceiling: number,
+    controller: AbortController, signal: AbortSignal, tick: (bytes: number) => void
+  ): Promise<void> {
+    type Work = { segment: SegmentState; failures: number; readyAt: number }
+    type Result = { work: Work; ok: true } | { work: Work; ok: false; error: unknown }
+    const pending: Work[] = []
+    const remaining = state.segments.filter((segment) => segment.position < segment.end)
+    if (!remaining.length) return
+    const lanes = Math.min(ceiling, remaining.length)
+    // Distribute the first requests across the file, then assign available
+    // connections more work as they finish.
+    for (let offset = 0; offset < Math.ceil(remaining.length / lanes); offset++) {
+      for (let lane = 0; lane < lanes; lane++) {
+        const index = Math.floor(lane * remaining.length / lanes) + offset
+        if (index < Math.floor((lane + 1) * remaining.length / lanes)) {
+          pending.push({ segment: remaining[index], failures: 0, readyAt: 0 })
+        }
+      }
+    }
+
+    let limit = ceiling
+    let successes = 0
+    let cooldownUntil = 0
+    const running = new Map<Work, Promise<Result>>()
+    try {
+      while (pending.length || running.size) {
+        signal.throwIfAborted()
+        const now = performance.now()
+        if (now >= cooldownUntil) {
+          while (running.size < limit) {
+            const next = pending.findIndex((work) => work.readyAt <= now)
+            if (next < 0) break
+            const [work] = pending.splice(next, 1)
+            const result = this.downloadRange(handle, file, work.segment, state, signal, tick)
+              .then<Result, Result>(() => ({ work, ok: true }), (error: unknown) => ({ work, ok: false, error }))
+            running.set(work, result)
+          }
+        }
+        if (handle.task.connections !== running.size) handle.patch({ connections: running.size })
+
+        const waiting = running.size < limit && pending.length > 0
+        const nextRetry = waiting ? pending.reduce((first, work) => Math.min(first, work.readyAt), Infinity) : Infinity
+        const delay = Math.max(cooldownUntil, nextRetry) - performance.now()
+        const wake = new AbortController()
+        const results: Array<Promise<Result | undefined>> = [...running.values()]
+        if (Number.isFinite(delay)) {
+          const waitSignal = AbortSignal.any([signal, wake.signal])
+          results.push(sleep(Math.min(2_147_000_000, Math.max(0, Math.ceil(delay))), waitSignal).then(() => undefined))
+        }
+        let result: Result | undefined
+        try {
+          result = await Promise.race(results)
+        } finally {
+          wake.abort()
+        }
+        if (!result) continue
+        running.delete(result.work)
+        if (result.ok) {
+          if (performance.now() >= cooldownUntil && ++successes >= limit && limit < ceiling) {
+            limit++
+            successes = 0
+          }
+          continue
+        }
+
+        const { error, work } = result
+        signal.throwIfAborted()
+        if (error instanceof RangeRejected || code(error) ||
+          (error instanceof HttpError && !error.retryable) || ++work.failures >= MAX_RANGE_ATTEMPTS) throw error
+        const backoff = 200 * 2 ** (work.failures - 1) + Math.random() * 150
+        const retryDelay = error instanceof HttpError ? error.retryDelay : 0
+        work.readyAt = performance.now() + Math.max(backoff, retryDelay)
+        if (error instanceof HttpError && error.congested) {
+          limit = Math.max(1, Math.floor(limit / 2))
+          successes = 0
+          cooldownUntil = Math.max(cooldownUntil, work.readyAt)
+        }
+        pending.push(work)
+      }
+    } catch (error) {
+      controller.abort(error)
+      await Promise.all(running.values())
+      throw error
+    }
+  }
+
   private async downloadRange(
     handle: TaskHandle, file: FileHandle, segment: SegmentState, state: Checkpoint,
     signal: AbortSignal, tick: (bytes: number) => void
   ): Promise<void> {
-    for (let attempt = 0; segment.position < segment.end; attempt++) {
-      signal.throwIfAborted()
-      const start = segment.position
-      const headers = this.headers(handle.task.url, handle.task.headers)
-      headers.set('Range', `bytes=${start}-${segment.end - 1}`)
-      headers.set('If-Range', state.validator!)
-      try {
-        await this.readResponse(handle, signal, headers, { start, end: segment.end - 1, state }, async (value, offset) => {
-          await writeAll(file, value, start + offset)
-          const next = start + offset + value.length
-          // Keep the last chunk out of the checkpoint until EOF is validated.
-          if (next < segment.end) {
-            const committed = next - segment.position
-            segment.position = next
-            tick(committed)
-          }
-        })
-        const committed = segment.end - segment.position
-        segment.position = segment.end
+    signal.throwIfAborted()
+    const start = segment.position
+    const headers = this.headers(handle.task.url, handle.task.headers)
+    headers.set('Range', `bytes=${start}-${segment.end - 1}`)
+    if (state.validator) headers.set('If-Range', state.validator)
+    await this.readResponse(handle, signal, headers, { start, end: segment.end - 1, state }, async (value, offset) => {
+      await writeAll(file, value, start + offset)
+      const next = start + offset + value.length
+      // Keep the last chunk out of the checkpoint until EOF is validated.
+      if (next < segment.end) {
+        const committed = next - segment.position
+        segment.position = next
         tick(committed)
-      } catch (error) {
-        if (signal.aborted || error instanceof RangeRejected || linkExpired(error) || code(error) ||
-          (error instanceof HttpError && error.status < 500 && ![408, 429].includes(error.status)) || attempt >= 4) throw error
-        await sleep(200 * 2 ** attempt + Math.random() * 150, signal)
       }
-    }
+    })
+    const committed = segment.end - segment.position
+    segment.position = segment.end
+    tick(committed)
   }
 
   private async readResponse(
@@ -427,7 +524,7 @@ export class HttpEngine {
       armTimeout()
       const res = await this.network.request(handle.task.url, headers, active)
       reader = res.body?.getReader()
-      if (!res.ok && res.status !== 416) throw new HttpError(res.status)
+      if (!res.ok && res.status !== 416) throw HttpError.from(res)
       let length = identity(res) ? contentLength(res) : undefined
       if (expected) {
         const range = contentRange(res)
@@ -435,11 +532,11 @@ export class HttpEngine {
         if (res.status !== 206 || !identity(res) || !range || range.start !== expected.start ||
           range.end !== expected.end || range.size !== expected.state.size ||
           digest(res.url || handle.task.url) !== expected.state.destination ||
-          strongEtag(res.headers.get('etag')) !== expected.state.validator ||
+          (expected.state.validator && strongEtag(res.headers.get('etag')) !== expected.state.validator) ||
           (expected.state.modified && res.headers.get('last-modified') !== expected.state.modified) ||
           (length !== undefined && length !== bytes)) throw new RangeRejected()
         length = bytes
-      } else if (res.status !== 200) throw new HttpError(res.status)
+      } else if (res.status !== 200) throw HttpError.from(res)
       if (!reader) {
         if (length === 0) return 0
         throw new Error('Empty response body.')

@@ -16,7 +16,7 @@ import {
   X,
   Zap
 } from 'lucide-react'
-import type { DownloadTask } from '@shared/types'
+import type { DownloadTask, SegmentState } from '@shared/types'
 import { useApp } from '../state'
 import {
   cn,
@@ -31,6 +31,18 @@ import {
   percentOf
 } from '../lib/format'
 import { KindIcon, ProgressBar, Ring, StatusPill } from './primitives'
+
+function progressBars(segments: SegmentState[]): SegmentState[] {
+  const bars: SegmentState[] = []
+  const size = Math.ceil(segments.length / 48)
+  for (let index = 0; index < segments.length; index += size) {
+    const pieces = segments.slice(index, index + size)
+    const { start } = pieces[0]
+    const received = pieces.reduce((total, piece) => total + piece.position - piece.start, 0)
+    bars.push({ start, end: pieces[pieces.length - 1].end, position: start + received })
+  }
+  return bars
+}
 
 export function DetailPanel(): React.JSX.Element {
   const { t, selected, lang, setSelectedId, pushToast, openNewLink } = useApp()
@@ -229,7 +241,7 @@ export function DetailPanel(): React.JSX.Element {
             <div className="mt-4">
               <SectionTitle icon={<Zap size={12} />} label={t.detail.segments} />
               <div className="flex h-2.5 w-full gap-[2px] overflow-hidden rounded-sm">
-                {task.segments.map((seg, i) => {
+                {progressBars(task.segments).map((seg, i) => {
                   const span = Math.max(1, seg.end - seg.start)
                   const pct = Math.max(0, Math.min(100, ((seg.position - seg.start) / span) * 100))
                   return (
@@ -249,7 +261,7 @@ export function DetailPanel(): React.JSX.Element {
               </div>
               <div className="mt-1.5 flex items-center justify-between text-[9.5px] text-faint">
                 <span>
-                  {task.connections} / {task.segments.length} {t.row.connections}
+                  {task.connections} {t.row.connections}
                 </span>
                 <span className="flex items-center gap-1">
                   <ShieldCheck size={10} />

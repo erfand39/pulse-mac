@@ -21,14 +21,20 @@ type FixtureOptions = {
   unknown?: boolean
   slow?: boolean
   cut?: boolean
+  noEtag?: boolean
+  busyOnce?: boolean
+  payload?: Buffer
 }
 
 async function fixture(t: TestContext, options: FixtureOptions = {}) {
   const dir = await fs.realpath(await fs.mkdtemp(join(tmpdir(), 'pulse-http-')))
-  const requests: Array<{ range?: string; ifRange?: string }> = []
-  let current = payload
+  const requests: Array<{ range?: string; ifRange?: string; at: number }> = []
+  let current = options.payload ?? payload
   let etag = '"first"'
   let didCut = false
+  let busyAt: number | undefined
+  let active = 0
+  let peak = 0
   const server = http.createServer(async (req, res) => {
     const data = current
     const tag = etag
@@ -41,7 +47,7 @@ async function fixture(t: TestContext, options: FixtureOptions = {}) {
       return
     }
     const range = req.headers.range
-    requests.push({ range, ifRange: req.headers['if-range'] as string | undefined })
+    requests.push({ range, ifRange: req.headers['if-range'] as string | undefined, at: performance.now() })
     if (range && options.ranged === '416') {
       res.writeHead(416, { 'Content-Range': `bytes */${data.length}` }).end()
       return
@@ -50,10 +56,20 @@ async function fixture(t: TestContext, options: FixtureOptions = {}) {
     if (matched && options.ranged !== 'absent' && (!options.ranged || options.ranged !== 'ignored' || range === 'bytes=0-0')) {
       const start = Number(matched[1])
       const end = Number(matched[2])
+      if (end !== 0) {
+        if (options.busyOnce && busyAt === undefined) {
+          busyAt = performance.now()
+          res.writeHead(429, { 'Retry-After': '1' }).end()
+          return
+        }
+        active++
+        peak = Math.max(peak, active)
+        res.once('close', () => active--)
+      }
       const wrong = options.ranged === 'wrong' && end !== 0 || options.ranged === 'bad-probe' && end === 0
       const body = data.subarray(start, end + 1)
       res.writeHead(206, {
-        ETag: tag,
+        ...(options.noEtag ? {} : { ETag: tag }),
         'Content-Range': `bytes ${start + Number(wrong)}-${end}/${data.length}`,
         'Content-Length': body.length
       })
@@ -108,7 +124,7 @@ async function fixture(t: TestContext, options: FixtureOptions = {}) {
       patch: (patch) => { holder.patch(item, patch); onPatch?.() }
     }, true)
   const change = (): void => { current = second; etag = '"second"' }
-  return { dir, engine, requests, run, task, change }
+  return { dir, engine, requests, run, task, change, busyAt: () => busyAt!, peak: () => peak }
 }
 
 test('multi-connection download validates ranges and SHA-256 after a redirect', async (t) => {
@@ -121,6 +137,66 @@ test('multi-connection download validates ranges and SHA-256 after a redirect', 
   assert.equal(task.fileName, 'نمونه.bin')
   assert.equal(sha(await fs.readFile(task.filePath!)), sha(payload))
   assert.ok(f.requests.filter((r) => r.ifRange === '"first"').length > 1)
+})
+
+test('parallel pieces share a connection ceiling and use spare connections', async (t) => {
+  const data = Buffer.concat(Array.from({ length: 4 }, () => payload))
+  const f = await fixture(t, { payload: data })
+  const task = f.task()
+  task.maxConnections = 3
+  await f.run(task)
+  assert.equal(task.status, 'completed', task.error)
+  assert.ok(f.requests.filter((request) => request.ifRange).length > 3)
+  assert.ok(f.peak() <= 3)
+  assert.equal(sha(await fs.readFile(task.filePath!)), sha(data))
+})
+
+test('pause and resume preserve checkpoints with more pieces than connections', async (t) => {
+  const data = Buffer.concat(Array.from({ length: 7 }, () => payload))
+  const f = await fixture(t, { payload: data, slow: true })
+  const task = f.task()
+  task.maxConnections = 8
+  const controller = new AbortController()
+  await f.run(task, controller, () => { if (task.downloaded > 100_000) controller.abort() })
+  assert.equal(task.status, 'paused', task.error)
+  assert.ok((task.segments?.length ?? 0) > 16)
+  let hasResume = false
+  await f.run(task, undefined, () => {
+    if (task.status === 'downloading' && task.downloaded > 0 && task.connections === 0) hasResume = true
+  })
+  assert.equal(task.status, 'completed', task.error)
+  assert.ok(hasResume)
+  assert.ok(task.segments?.every((segment) => segment.position === segment.end))
+  assert.equal(sha(await fs.readFile(task.filePath!)), sha(data))
+})
+
+test('server throttling postpones new pieces and reduces simultaneous retries', async (t) => {
+  const data = Buffer.concat(Array.from({ length: 4 }, () => payload))
+  const f = await fixture(t, { payload: data, busyOnce: true, slow: true })
+  const task = f.task()
+  const concurrency: number[] = []
+  await f.run(task, undefined, () => concurrency.push(task.connections))
+  assert.equal(task.status, 'completed', task.error)
+  const firstRetry = f.requests.filter((request) => request.ifRange)[4]
+  assert.ok(firstRetry.at - f.busyAt() >= 990, 'new pieces must honor Retry-After')
+  assert.ok(concurrency.includes(4))
+  assert.ok(concurrency.includes(2))
+  assert.equal(sha(await fs.readFile(task.filePath!)), sha(data))
+})
+
+test('an expected SHA-256 enables parallel ranges when the server supplies no ETag', async (t) => {
+  const f = await fixture(t, { noEtag: true })
+  const verified = f.task()
+  verified.checksum = sha(payload)
+  await f.run(verified)
+  assert.equal(verified.status, 'completed', verified.error)
+  assert.equal(sha(await fs.readFile(verified.filePath!)), verified.checksum)
+  assert.ok(f.requests.filter((request) => request.range && request.range !== 'bytes=0-0').length > 1)
+  f.requests.length = 0
+  const unchecked = f.task()
+  await f.run(unchecked)
+  assert.equal(unchecked.status, 'completed', unchecked.error)
+  assert.deepEqual(f.requests.map((request) => request.range), ['bytes=0-0', undefined])
 })
 
 for (const ranged of ['wrong', 'ignored', '416', 'bad-probe', 'absent'] as const) {

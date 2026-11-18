@@ -1,6 +1,6 @@
 {
   "name": "pulse-mac",
-  "version": "1.0.20-mac.1",
+  "version": "1.0.20-mac.2",
   "description": "Local download manager for Apple Silicon Macs",
   "main": "./out/main/index.js",
   "author": "TheGreatAzizi",
@@ -12,7 +12,8 @@
     "dist:mac:arm64": "npm run build:mac && node scripts/dist-mac.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "lint": "eslint src tests && git diff --check",
-    "test": "tsx --tsconfig tsconfig.node.json --test tests/*.test.ts"
+    "test": "tsx --tsconfig tsconfig.node.json --test tests/*.test.ts",
+    "bench:http": "tsx --tsconfig tsconfig.node.json scripts/bench-http.ts"
   },
   "dependencies": {
     "fs-chunk-store": "5.0.1",
@@ -109,7 +110,7 @@
       }
     ],
     "afterPack": "scripts/prune-native.cjs",
-    "buildVersion": "1.0.20"
+    "buildVersion": "1.0.21"
   },
   "engines": {
     "node": ">=24 <25"
