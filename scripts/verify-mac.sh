@@ -7,7 +7,7 @@ exe="$app/Contents/MacOS/Pulse Mac"
 file "$exe"
 test "$(lipo -archs "$exe")" = arm64
 find "$app" \( -name '*.node' -o -name '*.bare' \) -print0 | while IFS= read -r -d '' module; do
-  lipo -verify_arch arm64 "$module"
+  lipo "$module" -verify_arch arm64
 done
 version=$(node -p 'require("./package.json").version')
 codesign --verify --deep --strict "$app"
